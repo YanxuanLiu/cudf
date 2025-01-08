@@ -54,12 +54,20 @@ def right():
 
 
 @pytest.mark.parametrize(
-    "maintain_order", ["left", "left_right", "right_left", "right"]
+    "join_expr",
+    [
+        pl.col("a"),
+        ["c", "a"],
+    ],
 )
-def test_join_maintain_order_param_unsupported(left, right, maintain_order):
-    q = left.join(right, on=pl.col("a"), how="inner", maintain_order=maintain_order)
-
-    assert_ir_translation_raises(q, NotImplementedError)
+@pytest.mark.parametrize(
+    "maintain_order", ["none", "left", "right", "left_right", "right_left"]
+)
+def test_join_preserving_different_orderings(
+    left, right, how, join_expr, maintain_order
+):
+    query = left.join(right, on=join_expr, how=how, maintain_order=maintain_order)
+    assert_gpu_result_equal(query)
 
 
 @pytest.mark.parametrize(
