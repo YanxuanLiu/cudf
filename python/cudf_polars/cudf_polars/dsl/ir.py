@@ -1139,9 +1139,6 @@ class Join(IR):
         self.options = options
         self.children = (left, right)
         self._non_child_args = (self.left_on, self.right_on, self.options)
-        # # TODO: Implement maintain_order
-        # if options[5] != "none":
-        #     raise NotImplementedError("maintain_order not implemented yet")
         if any(
             isinstance(e.value, expr.Literal)
             for e in itertools.chain(self.left_on, self.right_on)
@@ -1224,7 +1221,6 @@ class Join(IR):
         dt = plc.interop.to_arrow(plc.types.SIZE_TYPE)
         init = plc.interop.from_arrow(pa.scalar(0, type=dt))
         step = plc.interop.from_arrow(pa.scalar(1, type=dt))
-
         if maintain_order in {"none", "left_right", "right_left"}:
             left_order = plc.copying.gather(
                 plc.Table([plc.filling.sequence(left_rows, init, step)]),
@@ -1256,8 +1252,6 @@ class Join(IR):
             sort_keys = left_order.columns() + right_order.columns()
         elif maintain_order == "right_left":
             sort_keys = right_order.columns() + left_order.columns()
-        else:
-            sort_keys = []
         return plc.sorting.stable_sort_by_key(
             plc.Table([lg, rg]),
             plc.Table(sort_keys),
