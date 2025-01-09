@@ -123,6 +123,11 @@ EXPECTED_FAILURES: Mapping[str, str] = {
     "tests/unit/io/test_scan.py::test_scan_include_file_name[False-scan_parquet-write_parquet]": "Need to add include_file_path to IR",
     "tests/unit/io/test_scan.py::test_scan_include_file_name[False-scan_csv-write_csv]": "Need to add include_file_path to IR",
     "tests/unit/io/test_scan.py::test_scan_include_file_name[False-scan_ndjson-write_ndjson]": "Need to add include_file_path to IR",
+    "tests/unit/io/test_write.py::test_write_async[read_parquet-write_parquet]": "Need to add include_file_path to IR",
+    "tests/unit/io/test_write.py::test_write_async[<lambda>-write_csv]": "Need to add include_file_path to IR",
+    "tests/unit/io/test_write.py::test_write_async[read_parquet-<lambda>]": "Need to add include_file_path to IR",
+    "tests/unit/io/test_write.py::test_write_async[<lambda>-<lambda>0]": "Need to add include_file_path to IR",
+    "tests/unit/io/test_write.py::test_write_async[<lambda>-<lambda>2]": "Need to add include_file_path to IR",
     "tests/unit/lazyframe/test_engine_selection.py::test_engine_import_error_raises[gpu]": "Expect this to pass because cudf-polars is installed",
     "tests/unit/lazyframe/test_engine_selection.py::test_engine_import_error_raises[engine1]": "Expect this to pass because cudf-polars is installed",
     "tests/unit/lazyframe/test_lazyframe.py::test_round[dtype1-123.55-1-123.6]": "Rounding midpoints is handled incorrectly",
@@ -190,6 +195,19 @@ EXPECTED_FAILURES: Mapping[str, str] = {
 }
 
 
+TESTS_TO_SKIP: Mapping[str, str] = {
+    # On Ubuntu 20.04, the tzdata package contains a bunch of symlinks
+    # for obsolete timezone names. However, the chrono_tz package that
+    # polars uses doesn't read /usr/share/zoneinfo, instead packaging
+    # the current zoneinfo database from IANA. Consequently, when this
+    # hypothesis-generated test runs and generates timezones from the
+    # available zoneinfo-reported timezones, we can get an error from
+    # polars that the requested timezone is unknown.
+    # Since this is random, just skip it, rather than xfailing.
+    "tests/unit/lazyframe/test_serde.py::test_lf_serde_roundtrip_binary": "chrono_tz doesn't have all tzdata symlink names",
+}
+
+
 def pytest_collection_modifyitems(
     session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
 ) -> None:
@@ -198,5 +216,7 @@ def pytest_collection_modifyitems(
         # Don't xfail tests if running without fallback
         return
     for item in items:
-        if item.nodeid in EXPECTED_FAILURES:
+        if item.nodeid in TESTS_TO_SKIP:
+            item.add_marker(pytest.mark.skip(reason=TESTS_TO_SKIP[item.nodeid]))
+        elif item.nodeid in EXPECTED_FAILURES:
             item.add_marker(pytest.mark.xfail(reason=EXPECTED_FAILURES[item.nodeid]))
