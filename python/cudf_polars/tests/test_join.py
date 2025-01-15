@@ -140,14 +140,6 @@ def test_left_join_with_slice(left, right, join_nulls, zlice):
             )
 
     with ctx:
-        # q = q.select(["a", "b", "c"])
-        print("LEFT\n", left.collect())
-        print("RIGHT\n", right.collect())
-        print(zlice, join_nulls)
-        print("CPU\n", q.collect())
-        print("GPU\n", q.collect(engine=pl.GPUEngine(raise_on_fail=True)))
-        # print("CPU slice\n", q.slice(*zlice).collect())
-        # print("GPU slice\n", q.slice(*zlice).collect(engine=pl.GPUEngine(raise_on_fail=True)))
         assert_gpu_result_equal(q)
 
 
