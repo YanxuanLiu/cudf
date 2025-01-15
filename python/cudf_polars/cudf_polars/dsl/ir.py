@@ -1218,10 +1218,12 @@ class Join(IR):
         -------
         list of reordered left and right gather maps.
         """
+        if maintain_order == "none":
+            return [lg, rg]
         dt = plc.interop.to_arrow(plc.types.SIZE_TYPE)
         init = plc.interop.from_arrow(pa.scalar(0, type=dt))
         step = plc.interop.from_arrow(pa.scalar(1, type=dt))
-        if maintain_order in {"none", "left_right", "right_left"}:
+        if maintain_order in {"left_right", "right_left"}:
             left_order = plc.copying.gather(
                 plc.Table([plc.filling.sequence(left_rows, init, step)]),
                 lg,
@@ -1232,26 +1234,24 @@ class Join(IR):
                 rg,
                 right_policy,
             )
+            if maintain_order == "left_right":
+                sort_keys = left_order.columns() + right_order.columns()
+            else:
+                sort_keys = right_order.columns() + left_order.columns()
         elif maintain_order == "left":
             left_order = plc.copying.gather(
                 plc.Table([plc.filling.sequence(left_rows, init, step)]),
                 lg,
                 left_policy,
             )
+            sort_keys = left_order.columns()
         elif maintain_order == "right":
             right_order = plc.copying.gather(
                 plc.Table([plc.filling.sequence(right_rows, init, step)]),
                 rg,
                 right_policy,
             )
-        if maintain_order == "left":
-            sort_keys = left_order.columns()
-        elif maintain_order == "right":
             sort_keys = right_order.columns()
-        elif maintain_order in {"none", "left_right"}:
-            sort_keys = left_order.columns() + right_order.columns()
-        elif maintain_order == "right_left":
-            sort_keys = right_order.columns() + left_order.columns()
         return plc.sorting.stable_sort_by_key(
             plc.Table([lg, rg]),
             plc.Table(sort_keys),
@@ -1319,7 +1319,6 @@ class Join(IR):
                 left, right = right, left
                 left_on, right_on = right_on, left_on
             lg, rg = join_fn(left_on.table, right_on.table, null_equality)
-            # Reorder maps based on maintain_order
             lg, rg = cls._reorder_maps(
                 left.num_rows,
                 lg,
