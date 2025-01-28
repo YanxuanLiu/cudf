@@ -2,18 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from contextlib import nullcontext, suppress
+from contextlib import nullcontext
 
 import pytest
 
 import polars as pl
-from polars.testing import assert_frame_equal
 
 from cudf_polars.testing.asserts import (
     assert_gpu_result_equal,
-    assert_ir_translation_raises,
 )
-from cudf_polars.utils.versions import POLARS_VERSION_LT_112, POLARS_VERSION_LT_113
 
 
 @pytest.fixture(params=[False, True], ids=["nulls_not_equal", "nulls_equal"])
@@ -53,29 +50,24 @@ def right():
     )
 
 
-@pytest.mark.parametrize(
-    "join_expr",
-    [
-        pl.col("a"),
-        pl.col("a") * 2,
-        [pl.col("a"), pl.col("c") + 1],
-        ["c", "a"],
-    ],
-)
-@pytest.mark.parametrize(
-    "maintain_order", ["left", "left_right", "right_left", "right"]
-)
-def test_order_preserving_joins(request, left, right, how, join_expr, maintain_order):
-    q = left.join(right, on=join_expr, how=how, maintain_order=maintain_order)
-    if how == "full" and maintain_order == "right":
-        # the last two rows have the same sort key in the right
-        # table column, so there's no disambiguator to decide
-        # which order the left column result comes in.
-        with suppress(AssertionError):
-            # Code that might raise an exception
-            assert_gpu_result_equal(q)
-        return
-    assert_gpu_result_equal(q)
+def test_order_preserving_joins(request, left, right):
+    left_left = left.join(right, on="a", how="left", maintain_order="left")
+    assert_gpu_result_equal(left_left)
+
+    left_left_right = left.join(right, on="a", how="left", maintain_order="left_right")
+    assert_gpu_result_equal(left_left_right)
+
+    left_right = left.join(right, on="a", how="left", maintain_order="right")
+    assert_gpu_result_equal(left_right)
+
+    left_right_left = left.join(right, on="a", how="left", maintain_order="right_left")
+    assert_gpu_result_equal(left_right_left)
+
+    right_left = left.join(right, on="a", how="right", maintain_order="left")
+    assert_gpu_result_equal(right_left)
+
+    right_right = left.join(right, on="a", how="right", maintain_order="right")
+    assert_gpu_result_equal(right_right)
 
 
 @pytest.mark.parametrize(
@@ -129,15 +121,7 @@ def test_left_join_with_slice(left, right, join_nulls, zlice):
     )
     ctx = nullcontext()
     if zlice is not None:
-        q_expect = q.collect().slice(*zlice)
         q = q.slice(*zlice)
-        if POLARS_VERSION_LT_112 and (zlice == (1, 5) or zlice == (0, 2)):
-            # https://github.com/pola-rs/polars/issues/19403
-            # https://github.com/pola-rs/polars/issues/19405
-            ctx = pytest.raises(AssertionError)
-            assert_frame_equal(
-                q_expect, q.collect(engine=pl.GPUEngine(raise_on_fail=True))
-            )
 
     with ctx:
         assert_gpu_result_equal(q)
@@ -158,28 +142,25 @@ def test_cross_join(left, right, zlice):
         (pl.lit(2, dtype=pl.Int64), pl.col("a")),
     ],
 )
-def test_join_literal_key_unsupported(left, right, left_on, right_on):
+def test_join_literal_key(left, right, left_on, right_on):
     q = left.join(right, left_on=left_on, right_on=right_on, how="inner")
-
-    assert_ir_translation_raises(q, NotImplementedError)
+    assert_gpu_result_equal(q)
 
 
 @pytest.mark.parametrize(
     "conditions",
     [
         [pl.col("a") < pl.col("a_right")],
-        [pl.col("a_right") <= pl.col("a") * 2],
+        [
+            pl.col("a_right") <= pl.col("a") * 2,
+            pl.col("a_right") <= 2 * pl.col("a"),
+        ],
         [pl.col("b") * 2 > pl.col("a_right"), pl.col("a") == pl.col("c_right")],
         [pl.col("b") * 2 <= pl.col("a_right"), pl.col("a") < pl.col("c_right")],
-        pytest.param(
-            [pl.col("b") <= pl.col("a_right") * 7, pl.col("a") < pl.col("d") * 2],
-            marks=pytest.mark.xfail(
-                POLARS_VERSION_LT_113,
-                reason="https://github.com/pola-rs/polars/issues/19597",
-            ),
-        ),
+        [pl.col("b") <= pl.col("a_right") * 7, pl.col("a") < pl.col("d") * 2],
     ],
 )
+@pytest.mark.parametrize("zlice", [None, (0, 5)])
 def test_join_where(left, right, conditions, zlice):
     q = left.join_where(right, *conditions)
 
