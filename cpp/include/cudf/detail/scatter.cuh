@@ -449,7 +449,9 @@ std::unique_ptr<table> scatter(table_view const& source,
 
     // For struct columns, we need to superimpose the null_mask of the parent over the null_mask of
     // the children.
-    std::for_each(result.begin(), result.end(), [=](auto& col) {
+    auto it = thrust::make_counting_iterator<size_type>(0);
+    std::for_each(it, it + num_columns, [=](size_type i) {
+      auto& col = result.column(i);
       auto const col_view = col->view();
       if (col_view.type().id() == type_id::STRUCT and col_view.nullable()) {
         auto const num_rows   = col_view.size();
@@ -461,7 +463,7 @@ std::unique_ptr<table> scatter(table_view const& source,
                                         std::move(contents.children),
                                         null_count,
                                         std::move(*contents.null_mask),
-                                        stream,
+                                        streams[i],
                                         mr);
       }
     });
