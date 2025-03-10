@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -451,7 +451,7 @@ std::unique_ptr<table> scatter(table_view const& source,
     // the children.
     auto it = thrust::make_counting_iterator<size_type>(0);
     std::for_each(it, it + num_columns, [=](size_type i) {
-      auto& col = result.column(i);
+      auto& col           = result.column(i);
       auto const col_view = col->view();
       if (col_view.type().id() == type_id::STRUCT and col_view.nullable()) {
         auto const num_rows   = col_view.size();
