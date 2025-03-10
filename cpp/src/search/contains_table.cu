@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,19 +14,24 @@
  * limitations under the License.
  */
 
-#include <join/join_common_utils.cuh>
+#include "join/join_common_utils.cuh"
 
+#include <cudf/detail/cuco_helpers.hpp>
 #include <cudf/detail/null_mask.hpp>
+#include <cudf/detail/search.hpp>
+#include <cudf/hashing/detail/helper_functions.cuh>
 #include <cudf/table/experimental/row_operators.cuh>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/type_checks.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 
-#include <thrust/iterator/counting_iterator.h>
-
 #include <cuco/static_set.cuh>
+#include <cuda/functional>
+#include <thrust/iterator/counting_iterator.h>
 
 #include <type_traits>
 
@@ -49,12 +54,12 @@ struct hasher_adapter {
 
   __device__ constexpr auto operator()(lhs_index_type idx) const noexcept
   {
-    return _haystack_hasher(static_cast<size_type>(idx));
+    return _needle_hasher(static_cast<size_type>(idx));
   }
 
   __device__ constexpr auto operator()(rhs_index_type idx) const noexcept
   {
-    return _needle_hasher(static_cast<size_type>(idx));
+    return _haystack_hasher(static_cast<size_type>(idx));
   }
 
  private:
@@ -72,8 +77,8 @@ struct comparator_adapter {
   {
   }
 
-  __device__ constexpr auto operator()(lhs_index_type lhs_index,
-                                       lhs_index_type rhs_index) const noexcept
+  __device__ constexpr auto operator()(rhs_index_type lhs_index,
+                                       rhs_index_type rhs_index) const noexcept
   {
     auto const lhs = static_cast<size_type>(lhs_index);
     auto const rhs = static_cast<size_type>(rhs_index);
@@ -114,7 +119,7 @@ std::pair<rmm::device_buffer, bitmask_type const*> build_row_bitmask(table_view 
   if (nullable_columns.size() > 1) {
     auto row_bitmask =
       cudf::detail::bitmask_and(
-        table_view{nullable_columns}, stream, rmm::mr::get_current_device_resource())
+        table_view{nullable_columns}, stream, cudf::get_current_device_resource_ref())
         .first;
     auto const row_bitmask_ptr = static_cast<bitmask_type const*>(row_bitmask.data());
     return std::pair(std::move(row_bitmask), row_bitmask_ptr);
@@ -154,9 +159,9 @@ void dispatch_nan_comparator(
   // Distinguish probing scheme CG sizes between nested and flat types for better performance
   auto const probing_scheme = [&]() {
     if constexpr (HasNested) {
-      return cuco::experimental::linear_probing<4, Hasher>{d_hasher};
+      return cuco::linear_probing<4, Hasher>{d_hasher};
     } else {
-      return cuco::experimental::linear_probing<1, Hasher>{d_hasher};
+      return cuco::linear_probing<1, Hasher>{d_hasher};
     }
   }();
 
@@ -185,7 +190,7 @@ rmm::device_uvector<bool> contains(table_view const& haystack,
                                    null_equality compare_nulls,
                                    nan_equality compare_nans,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr)
+                                   rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(cudf::have_same_types(haystack, needles), "Column types mismatch");
 
@@ -206,26 +211,32 @@ rmm::device_uvector<bool> contains(table_view const& haystack,
 
   auto const self_equal = cudf::experimental::row::equality::self_comparator(preprocessed_haystack);
   auto const two_table_equal = cudf::experimental::row::equality::two_table_comparator(
-    preprocessed_haystack, preprocessed_needles);
+    preprocessed_needles, preprocessed_haystack);
 
   // The output vector.
   auto contained = rmm::device_uvector<bool>(needles.num_rows(), stream, mr);
 
   auto const haystack_iter = cudf::detail::make_counting_transform_iterator(
-    size_type{0}, [] __device__(auto idx) { return lhs_index_type{idx}; });
+    size_type{0}, cuda::proclaim_return_type<rhs_index_type>([] __device__(auto idx) {
+      return rhs_index_type{idx};
+    }));
   auto const needles_iter = cudf::detail::make_counting_transform_iterator(
-    size_type{0}, [] __device__(auto idx) { return rhs_index_type{idx}; });
+    size_type{0}, cuda::proclaim_return_type<lhs_index_type>([] __device__(auto idx) {
+      return lhs_index_type{idx};
+    }));
 
   auto const helper_func =
     [&](auto const& d_self_equal, auto const& d_two_table_equal, auto const& probing_scheme) {
       auto const d_equal = comparator_adapter{d_self_equal, d_two_table_equal};
 
-      auto set = cuco::experimental::static_set{
-        cuco::experimental::extent{compute_hash_table_size(haystack.num_rows())},
-        cuco::empty_key{lhs_index_type{-1}},
+      auto set = cuco::static_set{
+        cuco::extent{compute_hash_table_size(haystack.num_rows())},
+        cuco::empty_key{rhs_index_type{-1}},
         d_equal,
         probing_scheme,
-        detail::hash_table_allocator_type{default_allocator<lhs_index_type>{}, stream},
+        {},
+        {},
+        cudf::detail::cuco_allocator<char>{rmm::mr::polymorphic_allocator<char>{}, stream},
         stream.value()};
 
       if (haystack_has_nulls && compare_nulls == null_equality::UNEQUAL) {

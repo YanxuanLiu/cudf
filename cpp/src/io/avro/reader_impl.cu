@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,17 +16,18 @@
 
 #include "avro.hpp"
 #include "avro_gpu.hpp"
-
-#include <io/comp/gpuinflate.hpp>
-#include <io/utilities/column_buffer.hpp>
-#include <io/utilities/hostdevice_vector.hpp>
+#include "io/comp/gpuinflate.hpp"
+#include "io/utilities/column_buffer.hpp"
+#include "io/utilities/hostdevice_vector.hpp"
 
 #include <cudf/detail/null_mask.hpp>
+#include <cudf/detail/utilities/functional.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/detail/avro.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -300,10 +301,12 @@ rmm::device_buffer decompress_data(datasource& source,
 
     size_t const uncompressed_data_size =
       std::reduce(uncompressed_data_sizes.begin(), uncompressed_data_sizes.end());
-    size_t const max_uncomp_block_size = std::reduce(
-      uncompressed_data_sizes.begin(), uncompressed_data_sizes.end(), 0, thrust::maximum<size_t>());
+    size_t const max_uncomp_block_size = std::reduce(uncompressed_data_sizes.begin(),
+                                                     uncompressed_data_sizes.end(),
+                                                     0,
+                                                     cudf::detail::maximum<size_t>());
 
-    size_t temp_size;
+    size_t temp_size = 0;
     status =
       nvcompBatchedSnappyDecompressGetTempSize(num_blocks, max_uncomp_block_size, &temp_size);
     CUDF_EXPECTS(status == nvcompStatus_t::nvcompSuccess,
@@ -374,7 +377,7 @@ std::vector<column_buffer> decode_data(metadata& meta,
                                        std::vector<std::pair<int, std::string>> const& selection,
                                        std::vector<data_type> const& column_types,
                                        rmm::cuda_stream_view stream,
-                                       rmm::mr::device_memory_resource* mr)
+                                       rmm::device_async_resource_ref mr)
 {
   auto out_buffers = std::vector<column_buffer>();
 
@@ -448,7 +451,7 @@ std::vector<column_buffer> decode_data(metadata& meta,
   }
 
   auto block_list = cudf::detail::make_device_uvector_async(
-    meta.block_list, stream, rmm::mr::get_current_device_resource());
+    meta.block_list, stream, cudf::get_current_device_resource_ref());
 
   schema_desc.host_to_device_async(stream);
 
@@ -484,7 +487,7 @@ std::vector<column_buffer> decode_data(metadata& meta,
 table_with_metadata read_avro(std::unique_ptr<cudf::io::datasource>&& source,
                               avro_reader_options const& options,
                               rmm::cuda_stream_view stream,
-                              rmm::mr::device_memory_resource* mr)
+                              rmm::device_async_resource_ref mr)
 {
   auto skip_rows = options.get_skip_rows();
   auto num_rows  = options.get_num_rows();
@@ -554,9 +557,11 @@ table_with_metadata read_avro(std::unique_ptr<cudf::io::datasource>&& source,
       auto d_global_dict_data = rmm::device_uvector<char>(0, stream);
 
       if (total_dictionary_entries > 0) {
-        auto h_global_dict      = std::vector<string_index_pair>(total_dictionary_entries);
-        auto h_global_dict_data = std::vector<char>(dictionary_data_size);
-        size_t dict_pos         = 0;
+        auto h_global_dict =
+          cudf::detail::make_host_vector<string_index_pair>(total_dictionary_entries, stream);
+        auto h_global_dict_data =
+          cudf::detail::make_host_vector<char>(dictionary_data_size, stream);
+        size_t dict_pos = 0;
 
         for (size_t i = 0; i < column_types.size(); ++i) {
           auto const col_idx          = selected_columns[i].first;
@@ -576,9 +581,9 @@ table_with_metadata read_avro(std::unique_ptr<cudf::io::datasource>&& source,
         }
 
         d_global_dict = cudf::detail::make_device_uvector_async(
-          h_global_dict, stream, rmm::mr::get_current_device_resource());
+          h_global_dict, stream, cudf::get_current_device_resource_ref());
         d_global_dict_data = cudf::detail::make_device_uvector_async(
-          h_global_dict_data, stream, rmm::mr::get_current_device_resource());
+          h_global_dict_data, stream, cudf::get_current_device_resource_ref());
 
         stream.synchronize();
       }

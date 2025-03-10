@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,13 +15,11 @@
  */
 
 #include "gpuinflate.hpp"
-
-#include <io/utilities/block_utils.cuh>
+#include "io/utilities/block_utils.cuh"
 
 #include <rmm/cuda_stream_view.hpp>
 
-namespace cudf {
-namespace io {
+namespace cudf::io::detail {
 constexpr int hash_bits = 12;
 
 // TBD: Tentatively limits to 2-byte codes to prevent long copy search followed by long literal
@@ -154,17 +152,7 @@ static __device__ uint8_t* StoreCopy(uint8_t* dst,
  */
 static inline __device__ uint32_t HashMatchAny(uint32_t v, uint32_t t)
 {
-#if (__CUDA_ARCH__ >= 700)
   return __match_any_sync(~0, v);
-#else
-  uint32_t err_map = 0;
-  for (uint32_t i = 0; i < hash_bits; i++, v >>= 1) {
-    uint32_t b       = v & 1;
-    uint32_t match_b = ballot(b);
-    err_map |= match_b ^ -(int32_t)b;
-  }
-  return ~err_map;
-#endif
 }
 
 /**
@@ -257,7 +245,7 @@ static __device__ uint32_t Match60(uint8_t const* src1,
  * @param[out] outputs Compression status per block
  * @param[in] count Number of blocks to compress
  */
-__global__ void __launch_bounds__(128)
+CUDF_KERNEL void __launch_bounds__(128)
   snap_kernel(device_span<device_span<uint8_t const> const> inputs,
               device_span<device_span<uint8_t> const> outputs,
               device_span<compression_result> results)
@@ -340,7 +328,6 @@ __global__ void __launch_bounds__(128)
     results[blockIdx.x].bytes_written = s->dst - s->dst_base;
     results[blockIdx.x].status =
       (s->dst > s->end) ? compression_status::FAILURE : compression_status::SUCCESS;
-    results[blockIdx.x].reserved = 0;
   }
 }
 
@@ -356,5 +343,4 @@ void gpu_snap(device_span<device_span<uint8_t const> const> inputs,
   }
 }
 
-}  // namespace io
-}  // namespace cudf
+}  // namespace cudf::io::detail

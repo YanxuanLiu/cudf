@@ -1,26 +1,33 @@
 #!/bin/bash
-# Copyright (c) 2023, NVIDIA CORPORATION.
+# Copyright (c) 2023-2025, NVIDIA CORPORATION.
 
 set -euo pipefail
 
 package_dir="python/cudf"
 
-export SKBUILD_CONFIGURE_OPTIONS="-DCUDF_BUILD_WHEELS=ON -DDETECT_CONDA_ENV=OFF"
+RAPIDS_PY_CUDA_SUFFIX="$(rapids-wheel-ctk-name-gen "${RAPIDS_CUDA_VERSION}")"
 
-# Force a build using the latest version of the code before this PR
-CUDF_BUILD_BRANCH=${1:-""}
-WHEEL_NAME="cudf"
-if [[ "${CUDF_BUILD_BRANCH}" == "main" ]]; then
-    MAIN_COMMIT=$(git merge-base HEAD origin/branch-23.10-xdf)
-    git checkout $MAIN_COMMIT
-    WHEEL_NAME="${WHEEL_NAME}_${CUDF_BUILD_BRANCH}"
-fi
+# Downloads libcudf and pylibcudf wheels from this current build,
+# then ensures 'cudf' wheel builds always use the 'libcudf' and 'pylibcudf' just built in the same CI run.
+#
+# Using env variable PIP_CONSTRAINT is necessary to ensure the constraints
+# are used when creating the isolated build environment.
+RAPIDS_PY_WHEEL_NAME="libcudf_${RAPIDS_PY_CUDA_SUFFIX}" rapids-download-wheels-from-s3 cpp /tmp/libcudf_dist
+RAPIDS_PY_WHEEL_NAME="pylibcudf_${RAPIDS_PY_CUDA_SUFFIX}" rapids-download-wheels-from-s3 python /tmp/pylibcudf_dist
+echo "libcudf-${RAPIDS_PY_CUDA_SUFFIX} @ file://$(echo /tmp/libcudf_dist/libcudf_*.whl)" > /tmp/constraints.txt
+echo "pylibcudf-${RAPIDS_PY_CUDA_SUFFIX} @ file://$(echo /tmp/pylibcudf_dist/pylibcudf_*.whl)" >> /tmp/constraints.txt
+export PIP_CONSTRAINT="/tmp/constraints.txt"
 
-./ci/build_wheel.sh ${WHEEL_NAME} ${package_dir}
+./ci/build_wheel.sh cudf ${package_dir}
 
-mkdir -p ${package_dir}/final_dist
-python -m auditwheel repair -w ${package_dir}/final_dist ${package_dir}/dist/*
+python -m auditwheel repair \
+    --exclude libcudf.so \
+    --exclude libnvcomp.so \
+    --exclude libkvikio.so \
+    --exclude librapids_logger.so \
+    -w ${package_dir}/final_dist \
+    ${package_dir}/dist/*
 
+./ci/validate_wheel.sh ${package_dir} final_dist
 
-RAPIDS_PY_CUDA_SUFFIX="$(rapids-wheel-ctk-name-gen ${RAPIDS_CUDA_VERSION})"
-RAPIDS_PY_WHEEL_NAME="${WHEEL_NAME}_${RAPIDS_PY_CUDA_SUFFIX}" rapids-upload-wheels-to-s3 ${package_dir}/final_dist
+RAPIDS_PY_WHEEL_NAME="cudf_${RAPIDS_PY_CUDA_SUFFIX}" rapids-upload-wheels-to-s3 python ${package_dir}/final_dist

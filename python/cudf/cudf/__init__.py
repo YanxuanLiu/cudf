@@ -1,4 +1,14 @@
-# Copyright (c) 2018-2023, NVIDIA CORPORATION.
+# Copyright (c) 2018-2025, NVIDIA CORPORATION.
+
+# If libcudf was installed as a wheel, we must request it to load the library symbols.
+# Otherwise, we assume that the library was installed in a system path that ld can find.
+try:
+    import libcudf
+except ModuleNotFoundError:
+    pass
+else:
+    libcudf.load_library()
+    del libcudf
 
 # _setup_numba _must be called before numba.cuda is imported, because
 # it sets the numba config variable responsible for enabling
@@ -17,15 +27,16 @@ from rmm.allocators.cupy import rmm_cupy_allocator
 from rmm.allocators.numba import RMMNumbaManager
 
 from cudf import api, core, datasets, testing
+from cudf._version import __git_commit__, __version__
 from cudf.api.extensions import (
     register_dataframe_accessor,
     register_index_accessor,
     register_series_accessor,
 )
 from cudf.api.types import dtype
-from cudf.core.algorithms import factorize
+from cudf.core.algorithms import factorize, unique
 from cudf.core.cut import cut
-from cudf.core.dataframe import DataFrame, from_dataframe, from_pandas, merge
+from cudf.core.dataframe import DataFrame, from_pandas, merge
 from cudf.core.dtypes import (
     CategoricalDtype,
     Decimal32Dtype,
@@ -35,27 +46,15 @@ from cudf.core.dtypes import (
     ListDtype,
     StructDtype,
 )
-from cudf.core.groupby import Grouper
+from cudf.core.groupby import Grouper, NamedAgg
 from cudf.core.index import (
     BaseIndex,
     CategoricalIndex,
     DatetimeIndex,
-    Float32Index,
-    Float64Index,
-    GenericIndex,
     Index,
-    Int8Index,
-    Int16Index,
-    Int32Index,
-    Int64Index,
     IntervalIndex,
     RangeIndex,
-    StringIndex,
     TimedeltaIndex,
-    UInt8Index,
-    UInt16Index,
-    UInt32Index,
-    UInt64Index,
     interval_range,
 )
 from cudf.core.missing import NA, NaT
@@ -99,9 +98,8 @@ cupy.cuda.set_allocator(rmm_cupy_allocator)
 rmm.register_reinitialize_hook(clear_cache)
 
 
-__version__ = "23.10.00"
-
 __all__ = [
+    "NA",
     "BaseIndex",
     "CategoricalDtype",
     "CategoricalIndex",
@@ -110,31 +108,19 @@ __all__ = [
     "DatetimeIndex",
     "Decimal32Dtype",
     "Decimal64Dtype",
-    "Float32Index",
-    "Float64Index",
-    "GenericIndex",
+    "Decimal128Dtype",
     "Grouper",
     "Index",
-    "Int16Index",
-    "Int32Index",
-    "Int64Index",
-    "Int8Index",
     "IntervalDtype",
     "IntervalIndex",
     "ListDtype",
     "MultiIndex",
-    "NA",
     "NaT",
     "RangeIndex",
     "Scalar",
     "Series",
-    "StringIndex",
     "StructDtype",
     "TimedeltaIndex",
-    "UInt16Index",
-    "UInt32Index",
-    "UInt64Index",
-    "UInt8Index",
     "api",
     "concat",
     "crosstab",
@@ -151,6 +137,7 @@ __all__ = [
     "isclose",
     "melt",
     "merge",
+    "option_context",
     "pivot",
     "pivot_table",
     "read_avro",

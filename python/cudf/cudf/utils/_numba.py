@@ -1,15 +1,28 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.
+# Copyright (c) 2023-2025, NVIDIA CORPORATION.
+from __future__ import annotations
 
 import glob
 import os
 import sys
-import warnings
+from functools import lru_cache
 
+import numba
 from numba import config as numba_config
+from packaging import version
 
-CC_60_PTX_FILE = os.path.join(
-    os.path.dirname(__file__), "../core/udf/shim_60.ptx"
-)
+
+# Use an lru_cache with a single value to allow a delayed import of
+# strings_udf. This is the easiest way to break an otherwise circular import
+# loop of _lib.*->cudautils->_numba->_lib.strings_udf
+@lru_cache
+def _get_cuda_build_version():
+    from cudf._lib import strings_udf
+
+    # The version is an integer, parsed as 1000 * major + 10 * minor
+    cuda_build_version = strings_udf.get_cuda_build_version()
+    cuda_major_version = cuda_build_version // 1000
+    cuda_minor_version = (cuda_build_version % 1000) // 10
+    return (cuda_major_version, cuda_minor_version)
 
 
 def _get_best_ptx_file(archs, max_compute_capability):
@@ -26,8 +39,8 @@ def _get_best_ptx_file(archs, max_compute_capability):
 
 def _get_ptx_file(path, prefix):
     if "RAPIDS_NO_INITIALIZE" in os.environ:
-        # cc=60 ptx is always built
-        cc = int(os.environ.get("STRINGS_UDF_CC", "60"))
+        # cc=70 ptx is always built
+        cc = int(os.environ.get("STRINGS_UDF_CC", "70"))
     else:
         from numba import cuda
 
@@ -65,7 +78,7 @@ def _get_ptx_file(path, prefix):
         return regular_result[1]
 
 
-def _patch_numba_mvc():
+def patch_numba_linker_cuda_11():
     # Enable the config option for minor version compatibility
     numba_config.CUDA_ENABLE_MINOR_VERSION_COMPATIBILITY = 1
 
@@ -92,11 +105,13 @@ def _setup_numba():
     version of the CUDA Toolkit used to build the PTX files shipped
     with the user cuDF package.
     """
-    # ptxcompiler is a requirement for cuda 11.x packages but not
-    # cuda 12.x packages. However its version checking machinery
-    # is still necessary. If a user happens to have ptxcompiler
-    # in a cuda 12 environment, it's use for the purposes of
-    # checking the driver and runtime versions is harmless
+
+    # Either ptxcompiler, or our vendored version (_ptxcompiler.py)
+    # is needed to determine the driver and runtime CUDA versions in
+    # the environment. In a CUDA 11.x environment, ptxcompiler is used
+    # to provide MVC directly, whereas for CUDA 12.x this is provided
+    # through pynvjitlink. The presence of either package does not
+    # perturb cuDF's operation in situations where they aren't used.
     try:
         from ptxcompiler.patch import NO_DRIVER, safe_get_versions
     except ModuleNotFoundError:
@@ -106,86 +121,40 @@ def _setup_numba():
     versions = safe_get_versions()
     if versions != NO_DRIVER:
         driver_version, runtime_version = versions
-        if driver_version >= (12, 0) and runtime_version > driver_version:
-            warnings.warn(
-                f"Using CUDA toolkit version {runtime_version} with CUDA "
-                f"driver version {driver_version} requires minor version "
-                "compatibility, which is not yet supported for CUDA "
-                "driver versions 12.0 and above. It is likely that many "
-                "cuDF operations will not work in this state. Please "
-                f"install CUDA toolkit version {driver_version} to "
-                "continue using cuDF."
-            )
-        else:
-            # Support MVC for all CUDA versions in the 11.x range
-            ptx_toolkit_version = _get_cuda_version_from_ptx_file(
-                CC_60_PTX_FILE
-            )
-            # Numba thinks cubinlinker is only needed if the driver is older
-            # than the CUDA runtime, but when PTX files are present, it might
-            # also need to patch because those PTX files may be compiled by
-            # a CUDA version that is newer than the driver as well
-            if (driver_version < ptx_toolkit_version) or (
-                driver_version < runtime_version
-            ):
-                _patch_numba_mvc()
+        shim_ptx_cuda_version = _get_cuda_build_version()
+
+        # MVC is required whenever any PTX is newer than the driver
+        # This could be the shipped shim PTX file (determined by the CUDA
+        # version used at build time) or the PTX emitted by the version of NVVM
+        # on the user system (determined by the user's CUDA runtime version)
+        if (driver_version < shim_ptx_cuda_version) or (
+            driver_version < runtime_version
+        ):
+            if driver_version < (12, 0):
+                patch_numba_linker_cuda_11()
+            else:
+                numba_config.CUDA_ENABLE_PYNVJITLINK = True
 
 
-def _get_cuda_version_from_ptx_file(path):
-    """
-    https://docs.nvidia.com/cuda/parallel-thread-execution/
-    Each PTX module must begin with a .version
-    directive specifying the PTX language version
-
-    example header:
-    //
-    // Generated by NVIDIA NVVM Compiler
-    //
-    // Compiler Build ID: CL-31057947
-    // Cuda compilation tools, release 11.6, V11.6.124
-    // Based on NVVM 7.0.1
-    //
-
-    .version 7.6
-    .target sm_52
-    .address_size 64
-
-    """
-    with open(path) as ptx_file:
-        for line in ptx_file:
-            if line.startswith(".version"):
-                ver_line = line
-                break
-        else:
-            raise ValueError("Could not read CUDA version from ptx file.")
-    version = ver_line.strip("\n").split(" ")[1]
-    # This dictionary maps from supported versions of NVVM to the
-    # PTX version it produces. The lowest value should be the minimum
-    # CUDA version required to compile the library. Currently CUDA 11.5
-    # or higher is required to build cudf. New CUDA versions should
-    # be added to this dictionary when officially supported.
-    ver_map = {
-        "7.5": (11, 5),
-        "7.6": (11, 6),
-        "7.7": (11, 7),
-        "7.8": (11, 8),
-        "8.0": (12, 0),
-        "8.1": (12, 1),
-    }
-
-    cuda_ver = ver_map.get(version)
-    if cuda_ver is None:
-        raise ValueError(
-            f"Could not map PTX version {version} to a CUDA version"
-        )
-
-    return cuda_ver
-
-
+# Avoids using contextlib.contextmanager due to additional overhead
 class _CUDFNumbaConfig:
-    def __enter__(self):
-        self.enter_val = numba_config.CUDA_LOW_OCCUPANCY_WARNINGS
+    def __enter__(self) -> None:
+        self.CUDA_LOW_OCCUPANCY_WARNINGS = (
+            numba_config.CUDA_LOW_OCCUPANCY_WARNINGS
+        )
         numba_config.CUDA_LOW_OCCUPANCY_WARNINGS = 0
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        numba_config.CUDA_LOW_OCCUPANCY_WARNINGS = self.enter_val
+        self.is_numba_lt_061 = version.parse(
+            numba.__version__
+        ) < version.parse("0.61")
+
+        if self.is_numba_lt_061:
+            self.CAPTURED_ERRORS = numba_config.CAPTURED_ERRORS
+            numba_config.CAPTURED_ERRORS = "new_style"
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        numba_config.CUDA_LOW_OCCUPANCY_WARNINGS = (
+            self.CUDA_LOW_OCCUPANCY_WARNINGS
+        )
+        if self.is_numba_lt_061:
+            numba_config.CAPTURED_ERRORS = self.CAPTURED_ERRORS

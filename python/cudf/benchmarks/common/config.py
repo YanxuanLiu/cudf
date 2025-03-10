@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION.
 
 """Module used for global configuration of benchmarks.
 
@@ -20,6 +20,7 @@ variables could affect test collection or other properties, we must define them
 in this file and import them in conftest.py to ensure that they are handled
 appropriately.
 """
+
 import os
 import sys
 
@@ -41,9 +42,9 @@ if "CUDF_BENCHMARKS_USE_PANDAS" in os.environ:
         items[:] = list(filter(is_pandas_compatible, items))
 
 else:
-    import cupy  # noqa: W0611, F401
+    import cupy  # noqa: F401
 
-    import cudf  # noqa: W0611, F401
+    import cudf  # noqa: F401
 
     def pytest_collection_modifyitems(session, config, items):
         pass

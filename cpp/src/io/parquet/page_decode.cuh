@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,18 +16,19 @@
 
 #pragma once
 
+#include "error.hpp"
+#include "io/utilities/block_utils.cuh"
 #include "parquet_gpu.hpp"
 #include "rle_stream.cuh"
 
-#include <io/utilities/block_utils.cuh>
-
+#include <cooperative_groups.h>
 #include <cuda/atomic>
 #include <cuda/std/tuple>
 
-namespace cudf::io::parquet::gpu {
+namespace cudf::io::parquet::detail {
 
 struct page_state_s {
-  constexpr page_state_s() noexcept {}
+  CUDF_HOST_DEVICE constexpr page_state_s() noexcept {}
   uint8_t const* data_start{};
   uint8_t const* data_end{};
   uint8_t const* lvl_end{};
@@ -44,7 +45,7 @@ struct page_state_s {
   int32_t dict_val{};
   uint32_t initial_rle_run[NUM_LEVEL_TYPES]{};   // [def,rep]
   int32_t initial_rle_value[NUM_LEVEL_TYPES]{};  // [def,rep]
-  int32_t error{};
+  kernel_error::value_type error{};
   PageInfo page{};
   ColumnChunkDesc col{};
 
@@ -71,15 +72,15 @@ struct page_state_s {
   // points to either nesting_decode_cache above when possible, or to the global source otherwise
   PageNestingDecodeInfo* nesting_info{};
 
-  inline __device__ void set_error_code(decode_error err) volatile
+  inline __device__ void set_error_code(decode_error err)
   {
-    cuda::atomic_ref<int32_t, cuda::thread_scope_block> ref{const_cast<int&>(error)};
-    ref.fetch_or(static_cast<int32_t>(err), cuda::std::memory_order_relaxed);
+    cuda::atomic_ref<kernel_error::value_type, cuda::thread_scope_block> ref{error};
+    ref.fetch_or(static_cast<kernel_error::value_type>(err), cuda::std::memory_order_relaxed);
   }
 
-  inline __device__ void reset_error_code() volatile
+  inline __device__ void reset_error_code()
   {
-    cuda::atomic_ref<int32_t, cuda::thread_scope_block> ref{const_cast<int&>(error)};
+    cuda::atomic_ref<kernel_error::value_type, cuda::thread_scope_block> ref{error};
     ref.store(0, cuda::std::memory_order_release);
   }
 };
@@ -120,9 +121,10 @@ struct null_count_back_copier {
 /**
  * @brief Test if the given page is in a string column
  */
-constexpr bool is_string_col(PageInfo const& page, device_span<ColumnChunkDesc const> chunks)
+__device__ constexpr bool is_string_col(PageInfo const& page,
+                                        device_span<ColumnChunkDesc const> chunks)
 {
-  if (page.flags & PAGEINFO_FLAGS_DICTIONARY != 0) { return false; }
+  if ((page.flags & PAGEINFO_FLAGS_DICTIONARY) != 0) { return false; }
   auto const& col = chunks[page.chunk_idx];
   return is_string_col(col);
 }
@@ -148,10 +150,21 @@ inline __device__ bool is_bounds_page(page_state_s* const s,
   size_t const begin      = start_row;
   size_t const end        = start_row + num_rows;
 
-  // for non-nested schemas, rows cannot span pages, so use a more restrictive test
-  return has_repetition
-           ? ((page_begin <= begin && page_end >= begin) || (page_begin <= end && page_end >= end))
-           : ((page_begin < begin && page_end > begin) || (page_begin < end && page_end > end));
+  // Test for list schemas.
+  auto const is_bounds_page_lists =
+    ((page_begin <= begin and page_end >= begin) or (page_begin <= end and page_end >= end));
+
+  // For non-list schemas, rows cannot span pages, so use a more restrictive test. Make sure to
+  // relax the test for `page_end` if we adjusted the `num_rows` for the last page to compensate
+  // for list row size estimates in `generate_list_column_row_count_estimates()` when chunked
+  // read mode.
+  auto const test_page_end_nonlists =
+    s->page.is_num_rows_adjusted ? page_end >= end : page_end > end;
+
+  auto const is_bounds_page_nonlists =
+    (page_begin < begin and page_end > begin) or (page_begin < end and test_page_end_nonlists);
+
+  return has_repetition ? is_bounds_page_lists : is_bounds_page_nonlists;
 }
 
 /**
@@ -185,12 +198,11 @@ inline __device__ bool is_page_contained(page_state_s* const s, size_t start_row
  * @return A pair containing a pointer to the string and its length
  */
 template <typename state_buf>
-inline __device__ cuda::std::pair<char const*, size_t> gpuGetStringData(page_state_s volatile* s,
-                                                                        state_buf volatile* sb,
-                                                                        int src_pos)
+inline __device__ string_index_pair gpuGetStringData(page_state_s* s, state_buf* sb, int src_pos)
 {
   char const* ptr = nullptr;
-  size_t len      = 0;
+  using len_type  = std::tuple_element<1, string_index_pair>::type;
+  len_type len    = 0;
 
   if (s->dict_base) {
     // String dictionary
@@ -199,9 +211,7 @@ inline __device__ cuda::std::pair<char const*, size_t> gpuGetStringData(page_sta
         ? sb->dict_idx[rolling_index<state_buf::dict_buf_size>(src_pos)] * sizeof(string_index_pair)
         : 0;
     if (dict_pos < (uint32_t)s->dict_size) {
-      auto const* src = reinterpret_cast<string_index_pair const*>(s->dict_base + dict_pos);
-      ptr             = src->first;
-      len             = src->second;
+      return *reinterpret_cast<string_index_pair const*>(s->dict_base + dict_pos);
     }
   } else {
     // Plain encoding
@@ -232,13 +242,19 @@ inline __device__ cuda::std::pair<char const*, size_t> gpuGetStringData(page_sta
  * additional values.
  */
 template <bool sizes_only, typename state_buf>
-__device__ cuda::std::pair<int, int> gpuDecodeDictionaryIndices(
-  page_state_s volatile* s, [[maybe_unused]] state_buf volatile* sb, int target_pos, int t)
+__device__ cuda::std::pair<int, int> gpuDecodeDictionaryIndices(page_state_s* s,
+                                                                [[maybe_unused]] state_buf* sb,
+                                                                int target_pos,
+                                                                int t)
 {
   uint8_t const* end = s->data_end;
   int dict_bits      = s->dict_bits;
   int pos            = s->dict_pos;
   int str_len        = 0;
+
+  // NOTE: racecheck warns about a RAW involving s->dict_pos, which is likely a false positive
+  // because the only path that does not include a sync will lead to s->dict_pos being overwritten
+  // with the same value
 
   while (pos < target_pos) {
     int is_literal, batch_len;
@@ -349,13 +365,14 @@ __device__ cuda::std::pair<int, int> gpuDecodeDictionaryIndices(
  * @return The new output position
  */
 template <typename state_buf>
-inline __device__ int gpuDecodeRleBooleans(page_state_s volatile* s,
-                                           state_buf volatile* sb,
-                                           int target_pos,
-                                           int t)
+inline __device__ int gpuDecodeRleBooleans(page_state_s* s, state_buf* sb, int target_pos, int t)
 {
   uint8_t const* end = s->data_end;
   int64_t pos        = s->dict_pos;
+
+  // NOTE: racecheck warns about a RAW involving s->dict_pos, which is likely a false positive
+  // because the only path that does not include a sync will lead to s->dict_pos being overwritten
+  // with the same value
 
   while (pos < target_pos) {
     int is_literal, batch_len;
@@ -413,48 +430,62 @@ inline __device__ int gpuDecodeRleBooleans(page_state_s volatile* s,
  * @param[in,out] s Page state input/output
  * @param[out] sb Page state buffer output
  * @param[in] target_pos Target output position
- * @param[in] t Thread ID
+ * @param[in] g Cooperative group (thread block or tile)
  * @tparam sizes_only True if only sizes are to be calculated
  * @tparam state_buf Typename of the `state_buf` (usually inferred)
+ * @tparam thread_group Typename of the cooperative group (inferred)
  *
  * @return Total length of strings processed
  */
-template <bool sizes_only, typename state_buf>
-__device__ size_type gpuInitStringDescriptors(page_state_s volatile* s,
-                                              [[maybe_unused]] state_buf volatile* sb,
+template <bool sizes_only, typename state_buf, typename thread_group>
+__device__ size_type gpuInitStringDescriptors(page_state_s* s,
+                                              [[maybe_unused]] state_buf* sb,
                                               int target_pos,
-                                              int t)
+                                              thread_group const& g)
 {
-  int pos       = s->dict_pos;
-  int total_len = 0;
+  int const t         = g.thread_rank();
+  int const dict_size = s->dict_size;
+  int k               = s->dict_val;
+  int pos             = s->dict_pos;
+  int total_len       = 0;
 
-  // This step is purely serial
-  if (!t) {
-    uint8_t const* cur = s->data_start;
-    int dict_size      = s->dict_size;
-    int k              = s->dict_val;
+  // All group threads can participate for fixed len byte arrays.
+  if (s->col.physical_type == FIXED_LEN_BYTE_ARRAY) {
+    int const dtype_len_in = s->dtype_len_in;
+    total_len              = min((target_pos - pos) * dtype_len_in, dict_size - s->dict_val);
+    if constexpr (!sizes_only) {
+      for (pos += t, k += t * dtype_len_in; pos < target_pos; pos += g.size()) {
+        sb->str_len[rolling_index<state_buf::str_buf_size>(pos)] =
+          (k < dict_size) ? dtype_len_in : 0;
+        // dict_idx is upperbounded by dict_size.
+        sb->dict_idx[rolling_index<state_buf::dict_buf_size>(pos)] = k;
+        // Increment k if needed.
+        if (k < dict_size) { k = min(k + (g.size() * dtype_len_in), dict_size); }
+      }
+    }
+    // Only thread_rank = 0 updates the s->dict_val
+    if (!t) { s->dict_val += total_len; }
+  }
+  // This step is purely serial for byte arrays
+  else {
+    if (!t) {
+      uint8_t const* cur = s->data_start;
 
-    while (pos < target_pos) {
-      int len = 0;
-      if ((s->col.data_type & 7) == FIXED_LEN_BYTE_ARRAY) {
-        if (k < dict_size) { len = s->dtype_len_in; }
-      } else {
+      for (int len = 0; pos < target_pos; pos++, len = 0) {
         if (k + 4 <= dict_size) {
           len = (cur[k]) | (cur[k + 1] << 8) | (cur[k + 2] << 16) | (cur[k + 3] << 24);
           k += 4;
           if (k + len > dict_size) { len = 0; }
         }
+        if constexpr (!sizes_only) {
+          sb->dict_idx[rolling_index<state_buf::dict_buf_size>(pos)] = k;
+          sb->str_len[rolling_index<state_buf::str_buf_size>(pos)]   = len;
+        }
+        k += len;
+        total_len += len;
       }
-      if constexpr (!sizes_only) {
-        sb->dict_idx[rolling_index<state_buf::dict_buf_size>(pos)] = k;
-        sb->str_len[rolling_index<state_buf::str_buf_size>(pos)]   = len;
-      }
-      k += len;
-      total_len += len;
-      pos++;
+      s->dict_val = k;
     }
-    s->dict_val = k;
-    __threadfence_block();
   }
 
   return total_len;
@@ -492,7 +523,7 @@ __device__ void gpuDecodeStream(
       if (!t) {
         uint8_t const* cur = cur_def;
         if (cur < end) { level_run = get_vlq32(cur, end); }
-        if (!(level_run & 1)) {
+        if (is_repeated_run(level_run)) {
           if (cur < end) level_val = cur[0];
           cur++;
           if (level_bits > 8) {
@@ -500,14 +531,9 @@ __device__ void gpuDecodeStream(
             cur++;
           }
         }
-        if (cur > end) {
-          s->set_error_code(decode_error::LEVEL_STREAM_OVERRUN);
-          break;
-        }
-        if (level_run <= 1) {
-          s->set_error_code(decode_error::INVALID_LEVEL_RUN);
-          break;
-        }
+        // If there are errors, set the error code and continue. The loop will be exited below.
+        if (cur > end) { s->set_error_code(decode_error::LEVEL_STREAM_OVERRUN); }
+        if (level_run <= 1) { s->set_error_code(decode_error::INVALID_LEVEL_RUN); }
         sym_len = (int32_t)(cur - cur_def);
         __threadfence_block();
       }
@@ -519,7 +545,7 @@ __device__ void gpuDecodeStream(
     if (s->error != 0) { break; }
 
     batch_len = min(num_input_values - value_count, 32);
-    if (level_run & 1) {
+    if (is_literal_run(level_run)) {
       // Literal run
       int batch_len8;
       batch_len  = min(batch_len, (level_run >> 1) * 8);
@@ -551,6 +577,9 @@ __device__ void gpuDecodeStream(
     batch_coded_count += batch_len;
     value_count += batch_len;
   }
+  // issue #14597
+  // racecheck reported race between reads at the start of this function and the writes below
+  __syncwarp();
 
   // update the stream info
   if (!t) {
@@ -683,6 +712,9 @@ __device__ void gpuUpdateValidityOffsetsAndRowIndices(int32_t target_input_value
                                                       level_t const* const def,
                                                       int t)
 {
+  // exit early if there's no work to do
+  if (s->input_value_count >= target_input_value_count) { return; }
+
   // max nesting depth of the column
   int const max_depth       = s->col.max_nesting_depth;
   bool const has_repetition = s->col.max_level[level_type::REPETITION] > 0;
@@ -753,7 +785,7 @@ __device__ void gpuUpdateValidityOffsetsAndRowIndices(int32_t target_input_value
           // for nested schemas, it's more complicated.  This warp will visit 32 incoming values,
           // however not all of them will necessarily represent a value at this nesting level. so
           // the validity bit for thread t might actually represent output value t-6. the correct
-          // position for thread t's bit is cur_value_count. for cuda 11 we could use
+          // position for thread t's bit is thread_value_count. for cuda 11 we could use
           // __reduce_or_sync(), but until then we have to do a warp reduce.
           WarpReduceOr32(is_valid << thread_value_count);
 
@@ -870,7 +902,7 @@ __device__ void gpuDecodeLevels(page_state_s* s,
 {
   bool has_repetition = s->col.max_level[level_type::REPETITION] > 0;
 
-  constexpr int batch_size = 32;
+  constexpr int batch_size = cudf::detail::warp_size;
   int cur_leaf_count       = target_leaf_count;
   while (s->error == 0 && s->nz_count < target_leaf_count &&
          s->input_value_count < s->num_input_values) {
@@ -918,7 +950,7 @@ inline __device__ uint32_t InitLevelSection(page_state_s* s,
 
   auto start = cur;
 
-  auto init_rle = [s, lvl, end, level_bits](uint8_t const* cur, uint8_t const* end) {
+  auto init_rle = [s, lvl, level_bits](uint8_t const* cur, uint8_t const* end) {
     uint32_t const run      = get_vlq32(cur, end);
     s->initial_rle_run[lvl] = run;
     if (!(run & 1)) {
@@ -991,8 +1023,21 @@ struct all_types_filter {
  * @brief Functor for setupLocalPageInfo that takes a mask of allowed types.
  */
 struct mask_filter {
-  int mask;
-  __device__ inline bool operator()(PageInfo const& page) { return (page.kernel_mask & mask) != 0; }
+  uint32_t mask;
+
+  __device__ mask_filter(uint32_t m) : mask(m) {}
+  __device__ mask_filter(decode_kernel_mask m) : mask(static_cast<uint32_t>(m)) {}
+
+  __device__ inline bool operator()(PageInfo const& page)
+  {
+    return BitAnd(mask, page.kernel_mask) != 0;
+  }
+};
+
+enum class page_processing_stage {
+  PREPROCESS,
+  STRING_BOUNDS,
+  DECODE,
 };
 
 /**
@@ -1004,7 +1049,7 @@ struct mask_filter {
  * @param[in] min_row Crop all rows below min_row
  * @param[in] num_rows Maximum number of rows to read
  * @param[in] filter Filtering function used to decide which pages to operate on
- * @param[in] is_decode_step If we are setting up for the decode step (instead of the preprocess)
+ * @param[in] stage What stage of the decoding process is this being called from
  * @tparam Filter Function that takes a PageInfo reference and returns true if the given page should
  * be operated on Currently only used by gpuComputePageSizes step)
  * @return True if this page should be processed further
@@ -1016,7 +1061,7 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
                                           size_t min_row,
                                           size_t num_rows,
                                           Filter filter,
-                                          bool is_decode_step)
+                                          page_processing_stage stage)
 {
   int t = threadIdx.x;
 
@@ -1107,7 +1152,8 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
   //
   // NOTE: this check needs to be done after the null counts have been zeroed out
   bool const has_repetition = s->col.max_level[level_type::REPETITION] > 0;
-  if (is_decode_step && s->num_rows == 0 &&
+  if ((stage == page_processing_stage::STRING_BOUNDS || stage == page_processing_stage::DECODE) &&
+      s->num_rows == 0 &&
       !(has_repetition && (is_bounds_page(s, min_row, num_rows, has_repetition) ||
                            is_page_contained(s, min_row, num_rows)))) {
     return false;
@@ -1124,11 +1170,11 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
     if (s->page.num_input_values > 0) {
       uint8_t* cur = s->page.page_data;
       uint8_t* end = cur + s->page.uncompressed_page_size;
-
-      uint32_t dtype_len_out = s->col.data_type >> 3;
-      s->ts_scale            = 0;
+      s->ts_scale  = 0;
       // Validate data type
-      auto const data_type = s->col.data_type & 7;
+      auto const data_type = s->col.physical_type;
+      auto const is_decimal =
+        s->col.logical_type.has_value() and s->col.logical_type->type == LogicalType::DECIMAL;
       switch (data_type) {
         case BOOLEAN:
           s->dtype_len = 1;  // Boolean are stored as 1 byte on the output
@@ -1139,12 +1185,15 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
           if (s->col.ts_clock_rate) {
             int32_t units = 0;
             // Duration types are not included because no scaling is done when reading
-            if (s->col.converted_type == TIMESTAMP_MILLIS) {
-              units = cudf::timestamp_ms::period::den;
-            } else if (s->col.converted_type == TIMESTAMP_MICROS) {
-              units = cudf::timestamp_us::period::den;
-            } else if (s->col.logical_type.TIMESTAMP.unit.isset.NANOS) {
-              units = cudf::timestamp_ns::period::den;
+            if (s->col.logical_type.has_value()) {
+              auto const& lt = *s->col.logical_type;
+              if (lt.is_timestamp_millis()) {
+                units = cudf::timestamp_ms::period::den;
+              } else if (lt.is_timestamp_micros()) {
+                units = cudf::timestamp_us::period::den;
+              } else if (lt.is_timestamp_nanos()) {
+                units = cudf::timestamp_ns::period::den;
+              }
             }
             if (units and units != s->col.ts_clock_rate) {
               s->ts_scale = (s->col.ts_clock_rate < units) ? -(units / s->col.ts_clock_rate)
@@ -1155,8 +1204,8 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
         case DOUBLE: s->dtype_len = 8; break;
         case INT96: s->dtype_len = 12; break;
         case BYTE_ARRAY:
-          if (s->col.converted_type == DECIMAL) {
-            auto const decimal_precision = s->col.decimal_precision;
+          if (is_decimal) {
+            auto const decimal_precision = s->col.logical_type->precision();
             s->dtype_len                 = [decimal_precision]() {
               if (decimal_precision <= MAX_DECIMAL32_PRECISION) {
                 return sizeof(int32_t);
@@ -1171,14 +1220,14 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
           }
           break;
         default:  // FIXED_LEN_BYTE_ARRAY:
-          s->dtype_len = dtype_len_out;
+          s->dtype_len = s->col.type_length;
           if (s->dtype_len <= 0) { s->set_error_code(decode_error::INVALID_DATA_TYPE); }
           break;
       }
       // Special check for downconversions
       s->dtype_len_in = s->dtype_len;
       if (data_type == FIXED_LEN_BYTE_ARRAY) {
-        if (s->col.converted_type == DECIMAL) {
+        if (is_decimal) {
           s->dtype_len = [dtype_len = s->dtype_len]() {
             if (dtype_len <= sizeof(int32_t)) {
               return sizeof(int32_t);
@@ -1192,17 +1241,17 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
           s->dtype_len = sizeof(string_index_pair);
         }
       } else if (data_type == INT32) {
-        if (dtype_len_out == 1) {
-          // INT8 output
-          s->dtype_len = 1;
-        } else if (dtype_len_out == 2) {
-          // INT16 output
-          s->dtype_len = 2;
-        } else if (s->col.converted_type == TIME_MILLIS) {
-          // INT64 output
-          s->dtype_len = 8;
+        // check for smaller bitwidths
+        if (s->col.logical_type.has_value()) {
+          auto const& lt = *s->col.logical_type;
+          if (lt.type == LogicalType::INTEGER) {
+            s->dtype_len = lt.bit_width() / 8;
+          } else if (lt.is_time_millis()) {
+            // cudf outputs as INT64
+            s->dtype_len = 8;
+          }
         }
-      } else if (data_type == BYTE_ARRAY && dtype_len_out == 4) {
+      } else if (data_type == BYTE_ARRAY && s->col.is_strings_to_cat) {
         s->dtype_len = 4;  // HASH32 output
       } else if (data_type == INT96) {
         s->dtype_len = 8;  // Convert to 64-bit timestamp
@@ -1217,7 +1266,7 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
       // NOTE: in a chunked read situation, s->col.column_data_base and s->col.valid_map_base
       // will be aliased to memory that has been freed when we get here in the non-decode step, so
       // we cannot check against nullptr.  we'll just check a flag directly.
-      if (is_decode_step) {
+      if (stage == page_processing_stage::DECODE) {
         int max_depth = s->col.max_nesting_depth;
         for (int idx = 0; idx < max_depth; idx++) {
           PageNestingDecodeInfo* nesting_info = &s->nesting_info[idx];
@@ -1270,32 +1319,37 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
       s->dict_bits = 0;
       s->dict_base = nullptr;
       s->dict_size = 0;
+      s->dict_val  = 0;
       // NOTE:  if additional encodings are supported in the future, modifications must
       // be made to is_supported_encoding() in reader_impl_preprocess.cu
       switch (s->page.encoding) {
         case Encoding::PLAIN_DICTIONARY:
-        case Encoding::RLE_DICTIONARY:
+        case Encoding::RLE_DICTIONARY: {
           // RLE-packed dictionary indices, first byte indicates index length in bits
-          if (((s->col.data_type & 7) == BYTE_ARRAY) && (s->col.str_dict_index)) {
+          auto const is_decimal =
+            s->col.logical_type.has_value() and s->col.logical_type->type == LogicalType::DECIMAL;
+          if ((s->col.physical_type == BYTE_ARRAY or
+               s->col.physical_type == FIXED_LEN_BYTE_ARRAY) and
+              not is_decimal and s->col.str_dict_index != nullptr) {
             // String dictionary: use index
             s->dict_base = reinterpret_cast<uint8_t const*>(s->col.str_dict_index);
-            s->dict_size = s->col.page_info[0].num_input_values * sizeof(string_index_pair);
+            s->dict_size = s->col.dict_page->num_input_values * sizeof(string_index_pair);
           } else {
-            s->dict_base =
-              s->col.page_info[0].page_data;  // dictionary is always stored in the first page
-            s->dict_size = s->col.page_info[0].uncompressed_page_size;
+            s->dict_base = s->col.dict_page->page_data;
+            s->dict_size = s->col.dict_page->uncompressed_page_size;
           }
           s->dict_run  = 0;
           s->dict_val  = 0;
           s->dict_bits = (cur < end) ? *cur++ : 0;
-          if (s->dict_bits > 32 || !s->dict_base) {
+          if (s->dict_bits > 32 || (!s->dict_base && s->col.dict_page->num_input_values > 0)) {
             s->set_error_code(decode_error::INVALID_DICT_WIDTH);
           }
-          break;
+        } break;
         case Encoding::PLAIN:
+        case Encoding::BYTE_STREAM_SPLIT:
           s->dict_size = static_cast<int32_t>(end - cur);
           s->dict_val  = 0;
-          if ((s->col.data_type & 7) == BOOLEAN) { s->dict_run = s->dict_size * 2 + 1; }
+          if (s->col.physical_type == BOOLEAN) { s->dict_run = s->dict_size * 2 + 1; }
           break;
         case Encoding::RLE: {
           // first 4 bytes are length of RLE data
@@ -1305,6 +1359,8 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
           s->dict_run = 0;
         } break;
         case Encoding::DELTA_BINARY_PACKED:
+        case Encoding::DELTA_LENGTH_BYTE_ARRAY:
+        case Encoding::DELTA_BYTE_ARRAY:
           // nothing to do, just don't error
           break;
         default: {
@@ -1366,13 +1422,13 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
 
       // if we're in the decoding step, jump directly to the first
       // value we care about
-      if (is_decode_step) {
+      if (stage == page_processing_stage::DECODE) {
         s->input_value_count = s->page.skipped_values > -1 ? s->page.skipped_values : 0;
-      } else {
+      } else if (stage == page_processing_stage::PREPROCESS) {
         s->input_value_count = 0;
         s->input_leaf_count  = 0;
-        s->page.skipped_values =
-          -1;  // magic number to indicate it hasn't been set for use inside UpdatePageSizes
+        // magic number to indicate it hasn't been set for use inside UpdatePageSizes
+        s->page.skipped_values      = -1;
         s->page.skipped_leaf_values = 0;
       }
     }
@@ -1384,4 +1440,4 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
   return true;
 }
 
-}  // namespace cudf::io::parquet::gpu
+}  // namespace cudf::io::parquet::detail

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,14 +17,16 @@
 #pragma once
 
 #include <cudf/detail/utilities/stacktrace.hpp>
+#include <cudf/utilities/export.hpp>
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 /**
  * @addtogroup utility_error
  * @{
@@ -47,7 +49,7 @@ struct stacktrace_recorder {
    *
    * @return The pointer to a null-terminated string storing the output stacktrace
    */
-  char const* stacktrace() const { return _stacktrace.c_str(); }
+  [[nodiscard]] char const* stacktrace() const { return _stacktrace.c_str(); }
 
  protected:
   std::string const _stacktrace;  //!< The whole stacktrace stored as one string.
@@ -76,6 +78,12 @@ struct logic_error : public std::logic_error, public stacktrace_recorder {
 
   // TODO Add an error code member? This would be useful for translating an
   // exception to an error code in a pure-C API
+
+  ~logic_error() override
+  {
+    // Needed so that the first instance of the implicit destructor for any TU isn't 'constructed'
+    // from a host+device function marking the implicit version also as host+device
+  }
 };
 /**
  * @brief Exception thrown when a CUDA error is encountered.
@@ -99,7 +107,7 @@ struct cuda_error : public std::runtime_error, public stacktrace_recorder {
    *
    * @return CUDA error code
    */
-  cudaError_t error_code() const { return _cudaError; }
+  [[nodiscard]] cudaError_t error_code() const { return _cudaError; }
 
  protected:
   cudaError_t _cudaError;  //!< CUDA error code
@@ -133,7 +141,7 @@ struct data_type_error : public std::invalid_argument, public stacktrace_recorde
 };
 /** @} */
 
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf
 
 #define STRINGIFY_DETAIL(x) #x                   ///< Stringify a macro argument
 #define CUDF_STRINGIFY(x)   STRINGIFY_DETAIL(x)  ///< Stringify a macro argument
@@ -222,7 +230,7 @@ struct data_type_error : public std::invalid_argument, public stacktrace_recorde
 
 /// @endcond
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 namespace detail {
 // @cond
 inline void throw_cuda_error(cudaError_t error, char const* file, unsigned int line)
@@ -230,7 +238,7 @@ inline void throw_cuda_error(cudaError_t error, char const* file, unsigned int l
   // Calls cudaGetLastError to clear the error status. It is nearly certain that a fatal error
   // occurred if it still returns the same error after a cleanup.
   cudaGetLastError();
-  auto const last = cudaFree(0);
+  auto const last = cudaFree(nullptr);
   auto const msg  = std::string{"CUDA error encountered at: " + std::string{file} + ":" +
                                std::to_string(line) + ": " + std::to_string(error) + " " +
                                cudaGetErrorName(error) + " " + cudaGetErrorString(error)};
@@ -244,7 +252,7 @@ inline void throw_cuda_error(cudaError_t error, char const* file, unsigned int l
 }
 // @endcond
 }  // namespace detail
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf
 
 /**
  * @brief Error checking macro for CUDA runtime API functions.

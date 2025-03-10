@@ -1,6 +1,6 @@
 /*
  *
- *  Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ *  Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -527,225 +528,6 @@ public class ColumnVectorTest extends CudfTestBase {
           "675c30ce6d1b27dcb5009b01be42e9bd", "8fa29148f63c1fe9248fdc4644e3a193",
           "1bc221b25e6c4825929e884092f4044f", "d41d8cd98f00b204e9800998ecf8427e")) {
       assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashStrings() {
-    try (ColumnVector v0 = ColumnVector.fromStrings(
-           "a", "B\nc",  "dE\"\u0100\t\u0101 \ud720\ud721\\Fg2\'",
-           "A very long (greater than 128 bytes/char string) to test a multi hash-step data point " +
-           "in the MD5 hash function. This string needed to be longer.A 60 character string to " +
-           "test MD5's message padding algorithm",
-           "hiJ\ud720\ud721\ud720\ud721", null);
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(42, new ColumnVector[]{v0});
-         ColumnVector expected = ColumnVector.fromBoxedInts(1485273170, 1709559900, 1423943036, 176121990, 1199621434, 42)) {
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashInts() {
-    try (ColumnVector v0 = ColumnVector.fromBoxedInts(0, 100, null, null, Integer.MIN_VALUE, null);
-         ColumnVector v1 = ColumnVector.fromBoxedInts(0, null, -100, null, null, Integer.MAX_VALUE);
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(42, new ColumnVector[]{v0, v1});
-         ColumnVector expected = ColumnVector.fromBoxedInts(59727262, 751823303, -1080202046, 42, 723455942, 133916647)) {
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashDoubles() {
-    try (ColumnVector v = ColumnVector.fromBoxedDoubles(
-          0.0, null, 100.0, -100.0, Double.MIN_NORMAL, Double.MAX_VALUE,
-          POSITIVE_DOUBLE_NAN_UPPER_RANGE, POSITIVE_DOUBLE_NAN_LOWER_RANGE,
-          NEGATIVE_DOUBLE_NAN_UPPER_RANGE, NEGATIVE_DOUBLE_NAN_LOWER_RANGE,
-          Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY);
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(new ColumnVector[]{v});
-         ColumnVector expected = ColumnVector.fromBoxedInts(1669671676, 0, -544903190, -1831674681, 150502665, 474144502, 1428788237, 1428788237, 1428788237, 1428788237, 420913893, 1915664072)) {
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashTimestamps() {
-    // The hash values were derived from Apache Spark in a manner similar to the one documented at
-    // https://github.com/rapidsai/cudf/blob/aa7ca46dcd9e/cpp/tests/hashing/hash_test.cpp#L281-L307
-    try (ColumnVector v = ColumnVector.timestampMicroSecondsFromBoxedLongs(
-        0L, null, 100L, -100L, 0x123456789abcdefL, null, -0x123456789abcdefL);
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(42, new ColumnVector[]{v});
-         ColumnVector expected = ColumnVector.fromBoxedInts(-1670924195, 42, 1114849490, 904948192, 657182333, 42, -57193045)) {
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashDecimal64() {
-    // The hash values were derived from Apache Spark in a manner similar to the one documented at
-    // https://github.com/rapidsai/cudf/blob/aa7ca46dcd9e/cpp/tests/hashing/hash_test.cpp#L281-L307
-    try (ColumnVector v = ColumnVector.decimalFromLongs(-7,
-        0L, 100L, -100L, 0x123456789abcdefL, -0x123456789abcdefL);
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(42, new ColumnVector[]{v});
-         ColumnVector expected = ColumnVector.fromBoxedInts(-1670924195, 1114849490, 904948192, 657182333, -57193045)) {
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashDecimal32() {
-    // The hash values were derived from Apache Spark in a manner similar to the one documented at
-    // https://github.com/rapidsai/cudf/blob/aa7ca46dcd9e/cpp/tests/hashing/hash_test.cpp#L281-L307
-    try (ColumnVector v = ColumnVector.decimalFromInts(-3,
-        0, 100, -100, 0x12345678, -0x12345678);
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(42, new ColumnVector[]{v});
-         ColumnVector expected = ColumnVector.fromBoxedInts(-1670924195, 1114849490, 904948192, -958054811, -1447702630)) {
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashDates() {
-    // The hash values were derived from Apache Spark in a manner similar to the one documented at
-    // https://github.com/rapidsai/cudf/blob/aa7ca46dcd9e/cpp/tests/hashing/hash_test.cpp#L281-L307
-    try (ColumnVector v = ColumnVector.timestampDaysFromBoxedInts(
-        0, null, 100, -100, 0x12345678, null, -0x12345678);
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(42, new ColumnVector[]{v});
-         ColumnVector expected = ColumnVector.fromBoxedInts(933211791, 42, 751823303, -1080202046, -1721170160, 42, 1852996993)) {
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashFloats() {
-    try (ColumnVector v = ColumnVector.fromBoxedFloats(
-          0f, 100f, -100f, Float.MIN_NORMAL, Float.MAX_VALUE, null,
-          POSITIVE_FLOAT_NAN_LOWER_RANGE, POSITIVE_FLOAT_NAN_UPPER_RANGE,
-          NEGATIVE_FLOAT_NAN_LOWER_RANGE, NEGATIVE_FLOAT_NAN_UPPER_RANGE,
-          Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY);
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(411, new ColumnVector[]{v});
-         ColumnVector expected = ColumnVector.fromBoxedInts(-235179434, 1812056886, 2028471189, 1775092689, -1531511762, 411, -1053523253, -1053523253, -1053523253, -1053523253, -1526256646, 930080402)){
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashBools() {
-    try (ColumnVector v0 = ColumnVector.fromBoxedBooleans(null, true, false, true, null, false);
-         ColumnVector v1 = ColumnVector.fromBoxedBooleans(null, true, false, null, false, true);
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(0, new ColumnVector[]{v0, v1});
-         ColumnVector expected = ColumnVector.fromBoxedInts(0, -1589400010, -239939054, -68075478, 593689054, -1194558265)) {
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashMixed() {
-    try (ColumnVector strings = ColumnVector.fromStrings(
-          "a", "B\n", "dE\"\u0100\t\u0101 \ud720\ud721",
-          "A very long (greater than 128 bytes/char string) to test a multi hash-step data point " +
-          "in the MD5 hash function. This string needed to be longer.",
-          null, null);
-         ColumnVector integers = ColumnVector.fromBoxedInts(0, 100, -100, Integer.MIN_VALUE, Integer.MAX_VALUE, null);
-         ColumnVector doubles = ColumnVector.fromBoxedDoubles(
-          0.0, 100.0, -100.0, POSITIVE_DOUBLE_NAN_LOWER_RANGE, POSITIVE_DOUBLE_NAN_UPPER_RANGE, null);
-         ColumnVector floats = ColumnVector.fromBoxedFloats(
-          0f, 100f, -100f, NEGATIVE_FLOAT_NAN_LOWER_RANGE, NEGATIVE_FLOAT_NAN_UPPER_RANGE, null);
-         ColumnVector bools = ColumnVector.fromBoxedBooleans(true, false, null, false, true, null);
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(1868, new ColumnVector[]{strings, integers, doubles, floats, bools});
-         ColumnVector expected = ColumnVector.fromBoxedInts(1936985022, 720652989, 339312041, 1400354989, 769988643, 1868)) {
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashStruct() {
-    try (ColumnVector strings = ColumnVector.fromStrings(
-        "a", "B\n", "dE\"\u0100\t\u0101 \ud720\ud721",
-        "A very long (greater than 128 bytes/char string) to test a multi hash-step data point " +
-            "in the MD5 hash function. This string needed to be longer.",
-        null, null);
-         ColumnVector integers = ColumnVector.fromBoxedInts(0, 100, -100, Integer.MIN_VALUE, Integer.MAX_VALUE, null);
-         ColumnVector doubles = ColumnVector.fromBoxedDoubles(
-             0.0, 100.0, -100.0, POSITIVE_DOUBLE_NAN_LOWER_RANGE, POSITIVE_DOUBLE_NAN_UPPER_RANGE, null);
-         ColumnVector floats = ColumnVector.fromBoxedFloats(
-             0f, 100f, -100f, NEGATIVE_FLOAT_NAN_LOWER_RANGE, NEGATIVE_FLOAT_NAN_UPPER_RANGE, null);
-         ColumnVector bools = ColumnVector.fromBoxedBooleans(true, false, null, false, true, null);
-         ColumnView structs = ColumnView.makeStructView(strings, integers, doubles, floats, bools);
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(1868, new ColumnView[]{structs});
-         ColumnVector expected = ColumnVector.spark32BitMurmurHash3(1868, new ColumnVector[]{strings, integers, doubles, floats, bools})) {
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashNestedStruct() {
-    try (ColumnVector strings = ColumnVector.fromStrings(
-        "a", "B\n", "dE\"\u0100\t\u0101 \ud720\ud721",
-        "A very long (greater than 128 bytes/char string) to test a multi hash-step data point " +
-            "in the MD5 hash function. This string needed to be longer.",
-        null, null);
-         ColumnVector integers = ColumnVector.fromBoxedInts(0, 100, -100, Integer.MIN_VALUE, Integer.MAX_VALUE, null);
-         ColumnVector doubles = ColumnVector.fromBoxedDoubles(
-             0.0, 100.0, -100.0, POSITIVE_DOUBLE_NAN_LOWER_RANGE, POSITIVE_DOUBLE_NAN_UPPER_RANGE, null);
-         ColumnVector floats = ColumnVector.fromBoxedFloats(
-             0f, 100f, -100f, NEGATIVE_FLOAT_NAN_LOWER_RANGE, NEGATIVE_FLOAT_NAN_UPPER_RANGE, null);
-         ColumnVector bools = ColumnVector.fromBoxedBooleans(true, false, null, false, true, null);
-         ColumnView structs1 = ColumnView.makeStructView(strings, integers);
-         ColumnView structs2 = ColumnView.makeStructView(structs1, doubles);
-         ColumnView structs3 = ColumnView.makeStructView(bools);
-         ColumnView structs = ColumnView.makeStructView(structs2, floats, structs3);
-         ColumnVector expected = ColumnVector.spark32BitMurmurHash3(1868, new ColumnVector[]{strings, integers, doubles, floats, bools});
-         ColumnVector result = ColumnVector.spark32BitMurmurHash3(1868, new ColumnView[]{structs})) {
-      assertColumnsAreEqual(expected, result);
-    }
-  }
-
-  @Test
-  void testSpark32BitMurmur3HashListsAndNestedLists() {
-    try (ColumnVector stringListCV = ColumnVector.fromLists(
-             new ListType(true, new BasicType(true, DType.STRING)),
-             Arrays.asList(null, "a"),
-             Arrays.asList("B\n", ""),
-             Arrays.asList("dE\"\u0100\t\u0101", " \ud720\ud721"),
-             Collections.singletonList("A very long (greater than 128 bytes/char string) to test a multi" +
-             " hash-step data point in the Murmur3 hash function. This string needed to be longer."),
-             Collections.singletonList(""),
-             null);
-         ColumnVector strings1 = ColumnVector.fromStrings(
-             "a", "B\n", "dE\"\u0100\t\u0101",
-             "A very long (greater than 128 bytes/char string) to test a multi hash-step data point " +
-             "in the Murmur3 hash function. This string needed to be longer.", null, null);
-         ColumnVector strings2 = ColumnVector.fromStrings(
-             null, "", " \ud720\ud721", null, "", null);
-         ColumnView stringStruct = ColumnView.makeStructView(strings1, strings2);
-         ColumnVector stringExpected = ColumnVector.spark32BitMurmurHash3(1868, new ColumnView[]{stringStruct});
-         ColumnVector stringResult = ColumnVector.spark32BitMurmurHash3(1868, new ColumnView[]{stringListCV});
-         ColumnVector intListCV = ColumnVector.fromLists(
-             new ListType(true, new BasicType(true, DType.INT32)),
-             null,
-             Arrays.asList(0, -2, 3),
-             Collections.singletonList(Integer.MAX_VALUE),
-             Arrays.asList(5, -6, null),
-             Collections.singletonList(Integer.MIN_VALUE),
-             null);
-         ColumnVector integers1 = ColumnVector.fromBoxedInts(null, 0, null, 5, Integer.MIN_VALUE, null);
-         ColumnVector integers2 = ColumnVector.fromBoxedInts(null, -2, Integer.MAX_VALUE, null, null, null);
-         ColumnVector integers3 = ColumnVector.fromBoxedInts(null, 3, null, -6, null, null);
-         ColumnVector intExpected =
-             ColumnVector.spark32BitMurmurHash3(1868, new ColumnVector[]{integers1, integers2, integers3});
-         ColumnVector intResult = ColumnVector.spark32BitMurmurHash3(1868, new ColumnVector[]{intListCV});
-         ColumnVector doubles = ColumnVector.fromBoxedDoubles(
-          0.0, 100.0, -100.0, POSITIVE_DOUBLE_NAN_LOWER_RANGE, POSITIVE_DOUBLE_NAN_UPPER_RANGE, null);
-         ColumnVector floats = ColumnVector.fromBoxedFloats(
-          0f, 100f, -100f, NEGATIVE_FLOAT_NAN_LOWER_RANGE, NEGATIVE_FLOAT_NAN_UPPER_RANGE, null);
-         ColumnView structCV = ColumnView.makeStructView(intListCV, stringListCV, doubles, floats);
-         ColumnVector nestedExpected =
-             ColumnVector.spark32BitMurmurHash3(1868, new ColumnView[]{intListCV, strings1, strings2, doubles, floats});
-         ColumnVector nestedResult =
-             ColumnVector.spark32BitMurmurHash3(1868, new ColumnView[]{structCV})) {
-      assertColumnsAreEqual(stringExpected, stringResult);
-      assertColumnsAreEqual(intExpected, intResult);
-      assertColumnsAreEqual(nestedExpected, nestedResult);
     }
   }
 
@@ -2170,6 +1952,15 @@ public class ColumnVectorTest extends CudfTestBase {
   }
 
   @Test
+  void testCodePoints() {
+    try (ColumnVector cv = ColumnVector.fromStrings("eee", "bb", null, "", "aa", "bbb", "ééé");
+         ColumnVector codePoints = cv.codePoints();
+         ColumnVector expected = ColumnVector.fromBoxedInts(101, 101, 101, 98, 98, 97, 97, 98, 98, 98, 50089, 50089, 50089)) {
+      assertColumnsAreEqual(expected, codePoints);
+    }
+  }
+
+  @Test
   void testEmptyStringColumnOpts() {
     try (ColumnVector cv = ColumnVector.fromStrings()) {
       try (ColumnVector len = cv.getCharLengths()) {
@@ -3192,7 +2983,7 @@ public class ColumnVectorTest extends CudfTestBase {
 
   @Test
   void testWindowDynamicNegative() {
-    try (ColumnVector precedingCol = ColumnVector.fromInts(3, 3, 3, 4, 4);
+    try (ColumnVector precedingCol = ColumnVector.fromInts(1, 2, 3, 4, 4);
          ColumnVector followingCol = ColumnVector.fromInts(-1, -1, -1, -1, 0)) {
       try (WindowOptions window = WindowOptions.builder()
           .minPeriods(2).window(precedingCol, followingCol).build()) {
@@ -3223,7 +3014,7 @@ public class ColumnVectorTest extends CudfTestBase {
   @Test
   void testWindowDynamic() {
     try (ColumnVector precedingCol = ColumnVector.fromInts(1, 2, 3, 1, 2);
-         ColumnVector followingCol = ColumnVector.fromInts(2, 2, 2, 2, 2)) {
+         ColumnVector followingCol = ColumnVector.fromInts(2, 2, 2, 1, 0)) {
       try (WindowOptions window = WindowOptions.builder().minPeriods(2)
           .window(precedingCol, followingCol).build()) {
         try (ColumnVector v1 = ColumnVector.fromInts(5, 4, 7, 6, 8);
@@ -3719,9 +3510,9 @@ public class ColumnVectorTest extends CudfTestBase {
   @Test
   void testCastDoubleToDecimal() {
     testCastNumericToDecimalsAndBack(DType.FLOAT64, false, 0,
-        () -> ColumnVector.fromBoxedDoubles(1.0, 2.1, -3.23, null, 2.41281, (double) Long.MAX_VALUE),
-        () -> ColumnVector.fromBoxedDoubles(1.0, 2.0, -3.0, null, 2.0, (double) Long.MAX_VALUE),
-        new Long[]{1L, 2L, -3L, null, 2L, Long.MAX_VALUE}
+        () -> ColumnVector.fromBoxedDoubles(1.0, 2.1, -3.23, null, 2.41281, (double) Integer.MAX_VALUE),
+        () -> ColumnVector.fromBoxedDoubles(1.0, 2.0, -3.0, null, 2.0, (double) Integer.MAX_VALUE),
+        new Long[]{1L, 2L, -3L, null, 2L, (long) Integer.MAX_VALUE}
     );
     testCastNumericToDecimalsAndBack(DType.FLOAT64, false, -2,
         () -> ColumnVector.fromBoxedDoubles(1.0, 2.1, -3.23, null, 2.41281, -55.01999),
@@ -4038,6 +3829,30 @@ public class ColumnVectorTest extends CudfTestBase {
   }
 
   @Test
+  void testStringContainsMulti() {
+    ColumnVector[] results = null;
+    try (ColumnVector haystack = ColumnVector.fromStrings("tést strings",
+        "Héllo cd",
+        "1 43 42 7",
+        "scala spark 42 other",
+        null,
+        "");
+        ColumnVector targets = ColumnVector.fromStrings("é", "42");
+        ColumnVector expected0 = ColumnVector.fromBoxedBooleans(true, true, false, false, null, false);
+        ColumnVector expected1 = ColumnVector.fromBoxedBooleans(false, false, true, true, null, false)) {
+      results = haystack.stringContains(targets);
+      assertColumnsAreEqual(results[0], expected0);
+      assertColumnsAreEqual(results[1], expected1);
+    } finally {
+      if (results != null) {
+        for (ColumnVector c : results) {
+          c.close();
+        }
+      }
+    }
+  }
+
+  @Test
   void testStringFindOperations() {
     try (ColumnVector testStrings = ColumnVector.fromStrings("", null, "abCD", "1a\"\u0100B1", "a\"\u0100B1", "1a\"\u0100B",
                                       "1a\"\u0100B1\n\t\'", "1a\"\u0100B1\u0453\u1322\u5112", "1a\"\u0100B1Fg26",
@@ -4086,6 +3901,43 @@ public class ColumnVectorTest extends CudfTestBase {
       }
     }
   }
+
+  @Test
+void testExtractReWithMultiLineDelimiters() {
+    String NEXT_LINE = "\u0085";
+    String LINE_SEPARATOR = "\u2028";
+    String PARAGRAPH_SEPARATOR = "\u2029";
+    String CARRIAGE_RETURN = "\r";
+    String NEW_LINE = "\n";
+
+    try (ColumnVector input = ColumnVector.fromStrings(
+            "boo:" + NEXT_LINE + "boo::" + LINE_SEPARATOR + "boo:::",
+            "boo:::" + LINE_SEPARATOR + "zzé" + CARRIAGE_RETURN + "lll",
+            "boo::",
+            "",
+            "boo::" + NEW_LINE,
+            "boo::" + CARRIAGE_RETURN,
+            "boo:" + NEXT_LINE + "boo::" + PARAGRAPH_SEPARATOR,
+            "boo:" + NEW_LINE + "boo::" + LINE_SEPARATOR,
+            "boo:" + NEXT_LINE + "boo::" + NEXT_LINE);
+         Table expected_ext_newline = new Table.TestBuilder()
+             .column("boo:::", null, "boo::", null, "boo::", "boo::", "boo::", "boo::", "boo::")
+             .build();
+         Table expected_default = new Table.TestBuilder()
+             .column("boo:::", null, "boo::", null, "boo::", null, null, null, null)
+             .build()) {
+
+        // Regex pattern to match 'boo:' followed by one or more colons at the end of the string
+        try (Table found = input.extractRe(new RegexProgram("(boo:+)$", EnumSet.of(RegexFlag.EXT_NEWLINE)))) {
+          assertColumnsAreEqual(expected_ext_newline.getColumns()[0], found.getColumns()[0]);
+        }
+
+        try (Table found = input.extractRe(new RegexProgram("(boo:+)$", EnumSet.of(RegexFlag.DEFAULT)))) {
+          assertColumnsAreEqual(expected_default.getColumns()[0], found.getColumns()[0]);
+        }
+    }
+  }
+
 
   @Test
   void testExtractAllRecord() {
@@ -6370,6 +6222,7 @@ public class ColumnVectorTest extends CudfTestBase {
         "  }\n" +
         "}";
 
+
     try (ColumnVector json = ColumnVector.fromStrings(jsonString, jsonString);
          ColumnVector expectedAuthors = ColumnVector.fromStrings("[\"Nigel Rees\",\"Evelyn " +
              "Waugh\",\"Herman Melville\",\"J. R. R. Tolkien\"]", "[\"Nigel Rees\",\"Evelyn " +
@@ -6379,6 +6232,37 @@ public class ColumnVectorTest extends CudfTestBase {
       assertColumnsAreEqual(expectedAuthors, gotAuthors);
     }
   }
+
+  @Test
+  void testGetJSONObjectWithSingleQuotes() {
+    String jsonString =  "{" +
+          "\'a\': \'A\"\'" +
+        "}";
+
+    GetJsonObjectOptions options = GetJsonObjectOptions.builder().allowSingleQuotes(true).build();
+    try (ColumnVector json = ColumnVector.fromStrings(jsonString, jsonString);
+         ColumnVector expectedAuthors = ColumnVector.fromStrings("A\"", "A\"");
+         Scalar path = Scalar.fromString("$.a");
+         ColumnVector gotAuthors = json.getJSONObject(path, options)) {
+      assertColumnsAreEqual(expectedAuthors, gotAuthors);
+  }
+}
+
+@Test
+void testGetJSONObjectWithInvalidQueries() {
+  String jsonString =  "{" +
+        "\'a\': \'A\"\'" +
+      "}";
+
+  GetJsonObjectOptions options = GetJsonObjectOptions.builder().allowSingleQuotes(true).build();
+  try (ColumnVector json = ColumnVector.fromStrings(jsonString, jsonString);
+       Scalar nullString = Scalar.fromString(null);
+       ColumnVector expectedAuthors = ColumnVector.fromScalar(nullString, 2);
+       Scalar path = Scalar.fromString(".");
+       ColumnVector gotAuthors = json.getJSONObject(path, options)) {
+    assertColumnsAreEqual(expectedAuthors, gotAuthors);
+  }
+}
 
   @Test
   void testMakeStructEmpty() {
@@ -6571,46 +6455,6 @@ public class ColumnVectorTest extends CudfTestBase {
       }
     });
     assertTrue(e.getMessage().contains("Duplicate mapping found for replacing child index"));
-  }
-
-  @Test
-  void testCopyWithBooleanColumnAsValidity() {
-    final Boolean T = true;
-    final Boolean F = false;
-    final Integer X = null;
-
-    // Straight-line: Invalidate every other row.
-    try (ColumnVector exemplar = ColumnVector.fromBoxedInts(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
-         ColumnVector validity = ColumnVector.fromBoxedBooleans(F, T, F, T, F, T, F, T, F, T);
-         ColumnVector expected = ColumnVector.fromBoxedInts(X, 2, X, 4, X, 6, X, 8, X, 10);
-         ColumnVector result = exemplar.copyWithBooleanColumnAsValidity(validity)) {
-      assertColumnsAreEqual(expected, result);
-    }
-
-    // Straight-line: Invalidate all Rows.
-    try (ColumnVector exemplar = ColumnVector.fromBoxedInts(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
-         ColumnVector validity = ColumnVector.fromBoxedBooleans(F, F, F, F, F, F, F, F, F, F);
-         ColumnVector expected = ColumnVector.fromBoxedInts(X, X, X, X, X, X, X, X, X, X);
-         ColumnVector result = exemplar.copyWithBooleanColumnAsValidity(validity)) {
-      assertColumnsAreEqual(expected, result);
-    }
-
-    // Nulls in the validity column are treated as invalid.
-    try (ColumnVector exemplar = ColumnVector.fromBoxedInts(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
-         ColumnVector validity = ColumnVector.fromBoxedBooleans(F, T, F, T, F, T, F, null, F, null);
-         ColumnVector expected = ColumnVector.fromBoxedInts(X, 2, X, 4, X, 6, X, X, X, X);
-         ColumnVector result = exemplar.copyWithBooleanColumnAsValidity(validity)) {
-      assertColumnsAreEqual(expected, result);
-    }
-
-    // Negative case: Mismatch in row count.
-    Exception x = assertThrows(CudfException.class, () ->  {
-      try (ColumnVector exemplar = ColumnVector.fromBoxedInts(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
-         ColumnVector validity = ColumnVector.fromBoxedBooleans(F, T, F, T);
-         ColumnVector result = exemplar.copyWithBooleanColumnAsValidity(validity)) {
-      }
-    });
-    assertTrue(x.getMessage().contains("Exemplar and validity columns must have the same size"));
   }
 
   @Test

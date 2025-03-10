@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2023, NVIDIA CORPORATION.
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
 
 import datetime
 import operator
@@ -9,8 +9,8 @@ import pandas as pd
 import pytest
 
 import cudf
-from cudf.testing import _utils as utils
-from cudf.testing._utils import assert_eq, assert_exceptions_equal
+from cudf.testing import _utils as utils, assert_eq
+from cudf.testing._utils import assert_exceptions_equal
 
 _TIMEDELTA_DATA = [
     [1000000, 200000, 3000000],
@@ -702,31 +702,31 @@ def test_timedelta_dt_properties(data, dtype):
     gsr = cudf.Series(data, dtype=dtype)
     psr = gsr.to_pandas()
 
-    def local_assert(expected, actual):
+    def local_assert(expected, actual, **kwargs):
         if gsr.isnull().any():
-            assert_eq(expected, actual.astype("float"))
+            assert_eq(expected, actual.astype("float"), **kwargs)
         else:
-            assert_eq(expected, actual)
+            assert_eq(expected, actual, **kwargs)
 
     expected_days = psr.dt.days
     actual_days = gsr.dt.days
 
-    local_assert(expected_days, actual_days)
+    local_assert(expected_days, actual_days, check_dtype=False)
 
     expected_seconds = psr.dt.seconds
     actual_seconds = gsr.dt.seconds
 
-    local_assert(expected_seconds, actual_seconds)
+    local_assert(expected_seconds, actual_seconds, check_dtype=False)
 
     expected_microseconds = psr.dt.microseconds
     actual_microseconds = gsr.dt.microseconds
 
-    local_assert(expected_microseconds, actual_microseconds)
+    local_assert(expected_microseconds, actual_microseconds, check_dtype=False)
 
     expected_nanoseconds = psr.dt.nanoseconds
     actual_nanoseconds = gsr.dt.nanoseconds
 
-    local_assert(expected_nanoseconds, actual_nanoseconds)
+    local_assert(expected_nanoseconds, actual_nanoseconds, check_dtype=False)
 
 
 @pytest.mark.parametrize(
@@ -1024,7 +1024,6 @@ def test_timedelta_index_properties(data, dtype, name):
     [
         np.timedelta64(4, "s"),
         np.timedelta64(456, "D"),
-        np.timedelta64(46, "h"),
         np.timedelta64("nat"),
         np.timedelta64(1, "s"),
         np.timedelta64(1, "ms"),
@@ -1186,7 +1185,6 @@ def test_timedelta_fillna(data, dtype, fill_value):
     ],
 )
 def test_timedelta_str_roundtrip(gsr, expected_series):
-
     actual_series = gsr.astype("str")
 
     assert_eq(expected_series, actual_series)
@@ -1325,7 +1323,7 @@ def test_numeric_to_timedelta(data, dtype, timedelta_dtype):
     psr = sr.to_pandas()
 
     actual = sr.astype(timedelta_dtype)
-    expected = pd.Series(psr.to_numpy().astype(timedelta_dtype))
+    expected = psr.astype(timedelta_dtype)
 
     assert_eq(expected, actual)
 
@@ -1469,3 +1467,78 @@ def test_timedelta_series_cmpops_pandas_compatibility(data1, data2, op):
         got = op(gsr1, gsr2)
 
     assert_eq(expect, got)
+
+
+@pytest.mark.parametrize(
+    "method, kwargs",
+    [
+        ["sum", {}],
+        ["mean", {}],
+        ["median", {}],
+        ["std", {}],
+        ["std", {"ddof": 0}],
+    ],
+)
+def test_tdi_reductions(method, kwargs):
+    pd_tdi = pd.TimedeltaIndex(["1 day", "2 days", "3 days"])
+    cudf_tdi = cudf.from_pandas(pd_tdi)
+
+    result = getattr(pd_tdi, method)(**kwargs)
+    expected = getattr(cudf_tdi, method)(**kwargs)
+    assert result == expected
+
+
+def test_tdi_asi8():
+    pd_tdi = pd.TimedeltaIndex(["1 day", "2 days", "3 days"])
+    cudf_tdi = cudf.from_pandas(pd_tdi)
+
+    result = pd_tdi.asi8
+    expected = cudf_tdi.asi8
+    assert_eq(result, expected)
+
+
+def test_tdi_unit():
+    pd_tdi = pd.TimedeltaIndex(
+        ["1 day", "2 days", "3 days"], dtype="timedelta64[ns]"
+    )
+    cudf_tdi = cudf.from_pandas(pd_tdi)
+
+    result = pd_tdi.unit
+    expected = cudf_tdi.unit
+    assert result == expected
+
+
+@pytest.mark.parametrize("data", _TIMEDELTA_DATA)
+@pytest.mark.parametrize("dtype", utils.TIMEDELTA_TYPES)
+def test_timedelta_series_total_seconds(data, dtype):
+    gsr = cudf.Series(data, dtype=dtype)
+    psr = gsr.to_pandas()
+
+    expected = psr.dt.total_seconds()
+    actual = gsr.dt.total_seconds()
+    assert_eq(expected, actual)
+
+
+@pytest.mark.parametrize("data", _TIMEDELTA_DATA)
+@pytest.mark.parametrize("dtype", utils.TIMEDELTA_TYPES)
+def test_timedelta_index_total_seconds(request, data, dtype):
+    gi = cudf.Index(data, dtype=dtype)
+    pi = gi.to_pandas()
+
+    expected = pi.total_seconds()
+    actual = gi.total_seconds()
+    assert_eq(expected, actual)
+
+
+def test_writable_numpy_array():
+    gi = cudf.Index([1, 2, 3], dtype="timedelta64[ns]")
+    expected_flags = pd.Index(
+        [1, 2, 3], dtype="timedelta64[ns]"
+    )._data._ndarray.flags
+
+    actual_flags = gi.to_pandas()._data._ndarray.flags
+    assert expected_flags.c_contiguous == actual_flags.c_contiguous
+    assert expected_flags.f_contiguous == actual_flags.f_contiguous
+    assert expected_flags.writeable == actual_flags.writeable
+    assert expected_flags.aligned == actual_flags.aligned
+    assert expected_flags.writebackifcopy == actual_flags.writebackifcopy

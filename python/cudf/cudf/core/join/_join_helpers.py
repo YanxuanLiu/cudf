@@ -1,16 +1,23 @@
-# Copyright (c) 2021-2023, NVIDIA CORPORATION.
+# Copyright (c) 2021-2025, NVIDIA CORPORATION.
 
 from __future__ import annotations
 
+import warnings
 from collections import abc
-from typing import TYPE_CHECKING, Any, Tuple, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
 import cudf
-from cudf.api.types import is_decimal_dtype, is_dtype_equal
+from cudf.api.types import is_dtype_equal
 from cudf.core.column import CategoricalColumn
-from cudf.core.dtypes import CategoricalDtype
+from cudf.core.dtypes import (
+    CategoricalDtype,
+    Decimal32Dtype,
+    Decimal64Dtype,
+    Decimal128Dtype,
+)
+from cudf.utils.dtypes import is_dtype_obj_numeric
 
 if TYPE_CHECKING:
     from cudf.core.column import ColumnBase
@@ -36,21 +43,21 @@ class _ColumnIndexer(_Indexer):
     def get(self, obj: cudf.DataFrame) -> ColumnBase:
         return obj._data[self.name]
 
-    def set(self, obj: cudf.DataFrame, value: ColumnBase, validate=False):
-        obj._data.set_by_label(self.name, value, validate=validate)
+    def set(self, obj: cudf.DataFrame, value: ColumnBase):
+        obj._data.set_by_label(self.name, value)
 
 
 class _IndexIndexer(_Indexer):
     def get(self, obj: cudf.DataFrame) -> ColumnBase:
-        return obj._index._data[self.name]
+        return obj.index._data[self.name]
 
-    def set(self, obj: cudf.DataFrame, value: ColumnBase, validate=False):
-        obj._index._data.set_by_label(self.name, value, validate=validate)
+    def set(self, obj: cudf.DataFrame, value: ColumnBase):
+        obj.index._data.set_by_label(self.name, value)
 
 
 def _match_join_keys(
     lcol: ColumnBase, rcol: ColumnBase, how: str
-) -> Tuple[ColumnBase, ColumnBase]:
+) -> tuple[ColumnBase, ColumnBase]:
     # Casts lcol and rcol to a common dtype for use as join keys. If no casting
     # is necessary, they are returned as is.
 
@@ -74,51 +81,39 @@ def _match_join_keys(
             common_type = ltype.categories.dtype
         else:
             common_type = rtype.categories.dtype
-        common_type = cudf.utils.dtypes._dtype_pandas_compatible(common_type)
         return lcol.astype(common_type), rcol.astype(common_type)
 
     if is_dtype_equal(ltype, rtype):
         return lcol, rcol
 
-    if is_decimal_dtype(ltype) or is_decimal_dtype(rtype):
+    if isinstance(
+        ltype, (Decimal32Dtype, Decimal64Dtype, Decimal128Dtype)
+    ) or isinstance(rtype, (Decimal32Dtype, Decimal64Dtype, Decimal128Dtype)):
         raise TypeError(
             "Decimal columns can only be merged with decimal columns "
             "of the same precision and scale"
         )
 
     if (
-        np.issubdtype(ltype, np.number)
-        and np.issubdtype(rtype, np.number)
-        and not (
-            np.issubdtype(ltype, np.timedelta64)
-            or np.issubdtype(rtype, np.timedelta64)
-        )
+        is_dtype_obj_numeric(ltype)
+        and is_dtype_obj_numeric(rtype)
+        and not (ltype.kind == "m" or rtype.kind == "m")
     ):
         common_type = (
             max(ltype, rtype)
             if ltype.kind == rtype.kind
-            else np.find_common_type([], (ltype, rtype))
+            else np.result_type(ltype, rtype)
         )
-    elif (
-        np.issubdtype(ltype, np.datetime64)
-        and np.issubdtype(rtype, np.datetime64)
-    ) or (
-        np.issubdtype(ltype, np.timedelta64)
-        and np.issubdtype(rtype, np.timedelta64)
+    elif (ltype.kind == "M" and rtype.kind == "M") or (
+        ltype.kind == "m" and rtype.kind == "m"
     ):
         common_type = max(ltype, rtype)
-    elif (
-        np.issubdtype(ltype, np.datetime64)
-        or np.issubdtype(ltype, np.timedelta64)
-    ) and not rcol.fillna(0).can_cast_safely(ltype):
+    elif ltype.kind in "mM" and not rcol.fillna(0).can_cast_safely(ltype):
         raise TypeError(
             f"Cannot join between {ltype} and {rtype}, please type-cast both "
             "columns to the same type."
         )
-    elif (
-        np.issubdtype(rtype, np.datetime64)
-        or np.issubdtype(rtype, np.timedelta64)
-    ) and not lcol.fillna(0).can_cast_safely(rtype):
+    elif rtype.kind in "mM" and not lcol.fillna(0).can_cast_safely(rtype):
         raise TypeError(
             f"Cannot join between {rtype} and {ltype}, please type-cast both "
             "columns to the same type."
@@ -126,13 +121,14 @@ def _match_join_keys(
 
     if how == "left" and rcol.fillna(0).can_cast_safely(ltype):
         return lcol, rcol.astype(ltype)
-
+    elif common_type is None:
+        common_type = np.dtype(np.float64)
     return lcol.astype(common_type), rcol.astype(common_type)
 
 
 def _match_categorical_dtypes_both(
     lcol: CategoricalColumn, rcol: CategoricalColumn, how: str
-) -> Tuple[ColumnBase, ColumnBase]:
+) -> tuple[ColumnBase, ColumnBase]:
     ltype, rtype = lcol.dtype, rcol.dtype
 
     # when both are ordered and both have the same categories,
@@ -170,9 +166,11 @@ def _match_categorical_dtypes_both(
         return lcol, rcol.astype(ltype)
     else:
         # merge categories
-        merged_categories = cudf.concat(
-            [ltype.categories, rtype.categories]
-        ).unique()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            merged_categories = cudf.concat(
+                [ltype.categories, rtype.categories]
+            ).unique()
         common_type = cudf.CategoricalDtype(
             categories=merged_categories, ordered=False
         )

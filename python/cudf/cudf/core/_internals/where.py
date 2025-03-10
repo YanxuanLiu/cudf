@@ -1,67 +1,76 @@
-# Copyright (c) 2021-2023, NVIDIA CORPORATION.
+# Copyright (c) 2021-2025, NVIDIA CORPORATION.
+from __future__ import annotations
 
 import warnings
-from typing import Tuple, Union
+from typing import TYPE_CHECKING
 
 import numpy as np
+import pyarrow as pa
 
 import cudf
-from cudf._typing import ScalarLike
-from cudf.api.types import (
-    _is_non_decimal_numeric_dtype,
-    is_bool_dtype,
-    is_categorical_dtype,
-    is_scalar,
-)
-from cudf.core.column import ColumnBase
+from cudf.api.types import is_scalar
+from cudf.core.dtypes import CategoricalDtype
+from cudf.core.scalar import pa_scalar_to_plc_scalar
 from cudf.utils.dtypes import (
-    _can_cast,
-    _dtype_can_hold_element,
+    cudf_dtype_to_pa_type,
     find_common_type,
+    is_dtype_obj_numeric,
     is_mixed_with_object_dtype,
 )
 
+if TYPE_CHECKING:
+    import pylibcudf as plc
 
-def _normalize_categorical(input_col, other):
-    if isinstance(input_col, cudf.core.column.CategoricalColumn):
-        if cudf.api.types.is_scalar(other):
-            try:
-                other = input_col._encode(other)
-            except ValueError:
-                # When other is not present in categories,
-                # fill with Null.
-                other = None
-            other = cudf.Scalar(other, dtype=input_col.codes.dtype)
-        elif isinstance(other, cudf.core.column.CategoricalColumn):
-            other = other.codes
-
-        input_col = input_col.codes
-    return input_col, other
+    from cudf._typing import DtypeObj, ScalarLike
+    from cudf.core.column import ColumnBase
 
 
 def _check_and_cast_columns_with_other(
     source_col: ColumnBase,
-    other: Union[ScalarLike, ColumnBase],
+    other: ScalarLike | ColumnBase,
     inplace: bool,
-) -> Tuple[ColumnBase, Union[ScalarLike, ColumnBase]]:
+) -> tuple[ColumnBase, plc.Scalar | ColumnBase]:
     # Returns type-casted `source_col` & `other` based on `inplace`.
-    source_dtype = source_col.dtype
-    if is_categorical_dtype(source_dtype):
-        return _normalize_categorical(source_col, other)
+    from cudf.core.column import as_column
 
+    source_dtype = source_col.dtype
     other_is_scalar = is_scalar(other)
-    if other_is_scalar:
-        if (isinstance(other, float) and not np.isnan(other)) and (
-            source_dtype.type(other) != other
-        ):
-            raise TypeError(
-                f"Cannot safely cast non-equivalent "
-                f"{type(other).__name__} to {source_dtype.name}"
+
+    if isinstance(source_dtype, CategoricalDtype):
+        if other_is_scalar:
+            try:
+                other = source_col._encode(other)  # type: ignore[attr-defined]
+            except ValueError:
+                # When other is not present in categories,
+                # fill with Null.
+                other = None
+            other = pa_scalar_to_plc_scalar(
+                pa.scalar(
+                    other,
+                    type=cudf_dtype_to_pa_type(source_col.codes.dtype),  # type: ignore[attr-defined]
+                )
             )
+        elif isinstance(other.dtype, CategoricalDtype):
+            other = other.codes  # type: ignore[union-attr]
+
+        return source_col.codes, other  # type: ignore[attr-defined]
+
+    if other_is_scalar:
+        if isinstance(other, (float, np.floating)) and not np.isnan(other):
+            try:
+                is_safe = source_dtype.type(other) == other
+            except OverflowError:
+                is_safe = False
+
+            if not is_safe:
+                raise TypeError(
+                    f"Cannot safely cast non-equivalent "
+                    f"{type(other).__name__} to {source_dtype.name}"
+                )
 
         if cudf.utils.utils.is_na_like(other):
-            return _normalize_categorical(
-                source_col, cudf.Scalar(other, dtype=source_dtype)
+            return source_col, pa_scalar_to_plc_scalar(
+                pa.scalar(None, type=cudf_dtype_to_pa_type(source_dtype))
             )
 
     mixed_err = (
@@ -70,26 +79,26 @@ def _check_and_cast_columns_with_other(
     )
 
     if inplace:
-        other = cudf.Scalar(other) if other_is_scalar else other
-        if is_mixed_with_object_dtype(other, source_col):
+        other_col = as_column(other)
+        if is_mixed_with_object_dtype(other_col, source_col):
             raise TypeError(mixed_err)
 
-        if not _can_cast(other.dtype, source_dtype):
+        if not _can_cast(other_col.dtype, source_dtype):
             warnings.warn(
                 f"Type-casting from {other.dtype} "
                 f"to {source_dtype}, there could be potential data loss"
             )
-        return _normalize_categorical(source_col, other.astype(source_dtype))
+        if other_is_scalar:
+            other_out = pa_scalar_to_plc_scalar(
+                pa.scalar(other, type=cudf_dtype_to_pa_type(source_dtype))
+            )
+        else:
+            other_out = other_col.astype(source_dtype)
+        return source_col, other_out
 
-    if _is_non_decimal_numeric_dtype(source_dtype) and _can_cast(
-        other, source_dtype
-    ):
-        common_dtype = source_dtype
-    elif (
-        isinstance(source_col, cudf.core.column.NumericalColumn)
-        and other_is_scalar
-        and _dtype_can_hold_element(source_dtype, other)
-    ):
+    if is_dtype_obj_numeric(source_dtype, include_decimal=False) and as_column(
+        other
+    ).can_cast_safely(source_dtype):
         common_dtype = source_dtype
     else:
         common_dtype = find_common_type(
@@ -99,29 +108,66 @@ def _check_and_cast_columns_with_other(
             ]
         )
 
-    if other_is_scalar:
-        other = cudf.Scalar(other)
-
-    if is_mixed_with_object_dtype(other, source_col) or (
-        is_bool_dtype(source_col) and not is_bool_dtype(common_dtype)
+    if is_mixed_with_object_dtype(as_column(other), source_col) or (
+        source_dtype.kind == "b" and common_dtype.kind != "b"
     ):
         raise TypeError(mixed_err)
 
-    other = other.astype(common_dtype)
-
-    return _normalize_categorical(source_col.astype(common_dtype), other)
-
-
-def _make_categorical_like(result, column):
-    if isinstance(column, cudf.core.column.CategoricalColumn):
-        result = cudf.core.column.build_categorical_column(
-            categories=column.categories,
-            codes=cudf.core.column.build_column(
-                result.base_data, dtype=result.dtype
-            ),
-            mask=result.base_mask,
-            size=result.size,
-            offset=result.offset,
-            ordered=column.ordered,
+    if other_is_scalar:
+        other_out = pa_scalar_to_plc_scalar(
+            pa.scalar(other, type=cudf_dtype_to_pa_type(common_dtype))
         )
-    return result
+    else:
+        other_out = other.astype(common_dtype)
+
+    return source_col.astype(common_dtype), other_out
+
+
+def _can_cast(from_dtype: DtypeObj, to_dtype: DtypeObj) -> bool:
+    """
+    Utility function to determine if we can cast
+    from `from_dtype` to `to_dtype`. This function primarily calls
+    `np.can_cast` but with some special handling around
+    cudf specific dtypes.
+    """
+    # TODO : Add precision & scale checking for
+    # decimal types in future
+
+    if isinstance(from_dtype, cudf.core.dtypes.DecimalDtype):
+        if isinstance(to_dtype, cudf.core.dtypes.DecimalDtype):
+            return True
+        elif isinstance(to_dtype, np.dtype):
+            if to_dtype.kind in {"i", "f", "u", "U", "O"}:
+                return True
+            else:
+                return False
+        else:
+            return False
+    elif isinstance(from_dtype, np.dtype):
+        if isinstance(to_dtype, np.dtype):
+            return np.can_cast(from_dtype, to_dtype)
+        elif isinstance(to_dtype, cudf.core.dtypes.DecimalDtype):
+            if from_dtype.kind in {"i", "f", "u", "U", "O"}:
+                return True
+            else:
+                return False
+        elif isinstance(to_dtype, cudf.CategoricalDtype):
+            return True
+        else:
+            return False
+    elif isinstance(from_dtype, cudf.ListDtype):
+        # TODO: Add level based checks too once casting of
+        # list columns is supported
+        if isinstance(to_dtype, cudf.ListDtype):
+            return np.can_cast(from_dtype.leaf_type, to_dtype.leaf_type)
+        else:
+            return False
+    elif isinstance(from_dtype, cudf.CategoricalDtype):
+        if isinstance(to_dtype, cudf.CategoricalDtype):
+            return True
+        elif isinstance(to_dtype, np.dtype):
+            return np.can_cast(from_dtype.categories.dtype, to_dtype)
+        else:
+            return False
+    else:
+        return np.can_cast(from_dtype, to_dtype)

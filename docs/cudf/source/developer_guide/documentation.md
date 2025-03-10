@@ -72,7 +72,7 @@ Our guidelines include one addition to the standard the `numpydoc` guide.
 Class properties, which are not explicitly covered, should be documented in the getter function.
 That choice makes `help` more useful as well as enabling docstring inheritance in subclasses.
 
-All of our docstrings are validated using [`pydocstyle`](http://www.pydocstyle.org/en/stable/).
+All of our docstrings are validated using [`ruff pydocstyle rules`](https://docs.astral.sh/ruff/rules/#pydocstyle-d).
 This ensures that docstring style is consistent and conformant across the codebase.
 
 ## Published documentation
@@ -164,7 +164,7 @@ The directive should be used inside docstrings like so:
 Docstring body
 
 .. pandas-compat::
-    **$API_NAME**
+    :meth:`pandas.DataFrame.METHOD`
 
     Explanation of differences
 ```

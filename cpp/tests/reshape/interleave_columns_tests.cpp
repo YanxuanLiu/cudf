@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/iterator_utilities.hpp>
+#include <cudf_test/testing_main.hpp>
 #include <cudf_test/type_lists.hpp>
 
 #include <cudf/column/column_factories.hpp>
@@ -362,19 +363,16 @@ TYPED_TEST(FixedPointTestAllReps, FixedPointInterleave)
 {
   using namespace numeric;
   using decimalXX = TypeParam;
+  using RepType   = typename decimalXX::rep;
 
   for (int i = 0; i > -4; --i) {
-    auto const ONE  = decimalXX{1, scale_type{i}};
-    auto const TWO  = decimalXX{2, scale_type{i}};
-    auto const FOUR = decimalXX{4, scale_type{i}};
-    auto const FIVE = decimalXX{5, scale_type{i}};
+    auto const a = cudf::test::fixed_point_column_wrapper<RepType>({1, 4}, scale_type{i});
+    auto const b = cudf::test::fixed_point_column_wrapper<RepType>({2, 5}, scale_type{i});
 
-    auto const a = cudf::test::fixed_width_column_wrapper<decimalXX>({ONE, FOUR});
-    auto const b = cudf::test::fixed_width_column_wrapper<decimalXX>({TWO, FIVE});
-
-    auto const input    = cudf::table_view{std::vector<cudf::column_view>{a, b}};
-    auto const expected = cudf::test::fixed_width_column_wrapper<decimalXX>({ONE, TWO, FOUR, FIVE});
-    auto const actual   = cudf::interleave_columns(input);
+    auto const input = cudf::table_view{std::vector<cudf::column_view>{a, b}};
+    auto const expected =
+      cudf::test::fixed_point_column_wrapper<RepType>({1, 2, 4, 5}, scale_type{i});
+    auto const actual = cudf::interleave_columns(input);
 
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, actual->view());
   }

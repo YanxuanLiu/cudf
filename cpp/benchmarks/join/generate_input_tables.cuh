@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,13 @@
 
 #pragma once
 
-#include <cudf/detail/utilities/device_atomics.cuh>
+#include <cudf/detail/utilities/cuda.cuh>
+#include <cudf/detail/utilities/cuda.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
 #include <thrust/distance.h>
@@ -31,27 +34,28 @@
 
 #include <cassert>
 
-__global__ static void init_curand(curandState* state, int const nstates)
+CUDF_KERNEL void init_curand(curandState* state, int const nstates)
 {
-  int ithread = threadIdx.x + blockIdx.x * blockDim.x;
+  int ithread = cudf::detail::grid_1d::global_thread_id();
 
   if (ithread < nstates) { curand_init(1234ULL, ithread, 0, state + ithread); }
 }
 
 template <typename key_type, typename size_type>
-__global__ static void init_build_tbl(key_type* const build_tbl,
-                                      size_type const build_tbl_size,
-                                      int const multiplicity,
-                                      curandState* state,
-                                      int const num_states)
+CUDF_KERNEL void init_build_tbl(key_type* const build_tbl,
+                                size_type const build_tbl_size,
+                                int const multiplicity,
+                                curandState* state,
+                                int const num_states)
 {
-  auto const start_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  auto const stride    = blockDim.x * gridDim.x;
+  auto const start_idx = cudf::detail::grid_1d::global_thread_id();
+  auto const stride    = cudf::detail::grid_1d::grid_stride();
   assert(start_idx < num_states);
 
   curandState localState = state[start_idx];
 
-  for (size_type idx = start_idx; idx < build_tbl_size; idx += stride) {
+  for (cudf::thread_index_type tidx = start_idx; tidx < build_tbl_size; tidx += stride) {
+    auto const idx = static_cast<size_type>(tidx);
     double const x = curand_uniform_double(&localState);
 
     build_tbl[idx] = static_cast<key_type>(x * (build_tbl_size / multiplicity));
@@ -61,22 +65,23 @@ __global__ static void init_build_tbl(key_type* const build_tbl,
 }
 
 template <typename key_type, typename size_type>
-__global__ void init_probe_tbl(key_type* const probe_tbl,
-                               size_type const probe_tbl_size,
-                               size_type const build_tbl_size,
-                               key_type const rand_max,
-                               double const selectivity,
-                               int const multiplicity,
-                               curandState* state,
-                               int const num_states)
+CUDF_KERNEL void init_probe_tbl(key_type* const probe_tbl,
+                                size_type const probe_tbl_size,
+                                size_type const build_tbl_size,
+                                key_type const rand_max,
+                                double const selectivity,
+                                int const multiplicity,
+                                curandState* state,
+                                int const num_states)
 {
-  auto const start_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  auto const stride    = blockDim.x * gridDim.x;
+  auto const start_idx = cudf::detail::grid_1d::global_thread_id();
+  auto const stride    = cudf::detail::grid_1d::grid_stride();
   assert(start_idx < num_states);
 
   curandState localState = state[start_idx];
 
-  for (size_type idx = start_idx; idx < probe_tbl_size; idx += stride) {
+  for (cudf::thread_index_type tidx = start_idx; tidx < probe_tbl_size; tidx += stride) {
+    auto const idx = static_cast<size_type>(tidx);
     key_type val;
     double x = curand_uniform_double(&localState);
 
@@ -146,13 +151,8 @@ void generate_input_tables(key_type* const build_tbl,
   CUDF_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
     &num_blocks_init_probe_tbl, init_probe_tbl<key_type, size_type>, block_size, 0));
 
-  int dev_id{-1};
-  CUDF_CUDA_TRY(cudaGetDevice(&dev_id));
-
-  int num_sms{-1};
-  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
-
-  int const num_states =
+  auto const num_sms = cudf::detail::num_multiprocessors();
+  auto const num_states =
     num_sms * std::max(num_blocks_init_build_tbl, num_blocks_init_probe_tbl) * block_size;
   rmm::device_uvector<curandState> devStates(num_states, cudf::get_default_stream());
 

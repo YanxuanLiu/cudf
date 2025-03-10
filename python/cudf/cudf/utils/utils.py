@@ -1,27 +1,26 @@
-# Copyright (c) 2020-2023, NVIDIA CORPORATION.
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
+from __future__ import annotations
 
 import decimal
 import functools
-import hashlib
 import os
 import traceback
 import warnings
-from functools import partial
-from typing import FrozenSet, Set, Union
+from typing import Any
 
 import numpy as np
 import pandas as pd
-from nvtx import annotate
 
+import pylibcudf as plc
 import rmm
 
 import cudf
-import cudf.api.types
 from cudf.core import column
 from cudf.core.buffer import as_buffer
+from cudf.utils.dtypes import SIZE_TYPE_DTYPE
 
 # The size of the mask in bytes
-mask_dtype = cudf.api.types.dtype(np.int32)
+mask_dtype = SIZE_TYPE_DTYPE
 mask_bitsize = mask_dtype.itemsize * 8
 
 # Mapping from ufuncs to the corresponding binary operators.
@@ -120,8 +119,6 @@ _EQUALITY_OPS = {
     "__ge__",
 }
 
-_NVTX_COLORS = ["green", "blue", "purple", "rapids"]
-
 # The test root is set by pytest to support situations where tests are run from
 # a source tree on a built version of cudf.
 NO_EXTERNAL_ONLY_APIS = os.getenv("NO_EXTERNAL_ONLY_APIS")
@@ -164,8 +161,9 @@ def _external_only_api(func, alternative=""):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         # Check the immediately preceding frame to see if it's in cudf.
-        frame, lineno = next(traceback.walk_stack(None))
-        fn = frame.f_code.co_filename
+        pre_frame = traceback.extract_stack(limit=2)[0]
+        fn = pre_frame.filename
+        lineno = pre_frame.lineno
         if _cudf_root in fn and _tests_root not in fn:
             raise RuntimeError(
                 f"External-only API called in {fn} at line {lineno}. "
@@ -212,7 +210,7 @@ class GetAttrGetItemMixin:
 
     # Tracking of protected keys by each subclass is necessary to make the
     # `__getattr__`->`__getitem__` call safe. See
-    # https://nedbatchelder.com/blog/201010/surprising_getattr_recursion.html  # noqa: E501
+    # https://nedbatchelder.com/blog/201010/surprising_getattr_recursion.html
     # for an explanation. In brief, defining the `_PROTECTED_KEYS` allows this
     # class to avoid calling `__getitem__` inside `__getattr__` when
     # `__getitem__` will internally again call `__getattr__`, resulting in an
@@ -223,7 +221,7 @@ class GetAttrGetItemMixin:
     # `__setstate__`, but this class may be used in complex multiple
     # inheritance hierarchies that might also override serialization.  The
     # solution here is a minimally invasive change that avoids such conflicts.
-    _PROTECTED_KEYS: Union[FrozenSet[str], Set[str]] = frozenset()
+    _PROTECTED_KEYS: frozenset[str] | set[str] = frozenset()
 
     def __getattr__(self, key):
         if key in self._PROTECTED_KEYS:
@@ -255,7 +253,7 @@ def pa_mask_buffer_to_mask(mask_buf, size):
     """
     Convert PyArrow mask buffer to cuDF mask buffer
     """
-    mask_size = cudf._lib.null_mask.bitmask_allocation_size_bytes(size)
+    mask_size = plc.null_mask.bitmask_allocation_size_bytes(size)
     if mask_buf.size < mask_size:
         dbuf = rmm.DeviceBuffer(size=mask_size)
         dbuf.copy_from_host(np.asarray(mask_buf).view("u1"))
@@ -343,26 +341,13 @@ def is_na_like(obj):
     return obj is None or obj is cudf.NA or obj is cudf.NaT
 
 
-def _get_color_for_nvtx(name):
-    m = hashlib.sha256()
-    m.update(name.encode())
-    hash_value = int(m.hexdigest(), 16)
-    idx = hash_value % len(_NVTX_COLORS)
-    return _NVTX_COLORS[idx]
-
-
-def _cudf_nvtx_annotate(func, domain="cudf_python"):
-    """Decorator for applying nvtx annotations to methods in cudf."""
-    return annotate(
-        message=func.__qualname__,
-        color=_get_color_for_nvtx(func.__qualname__),
-        domain=domain,
-    )(func)
-
-
-_dask_cudf_nvtx_annotate = partial(
-    _cudf_nvtx_annotate, domain="dask_cudf_python"
-)
+def _is_null_host_scalar(slr) -> bool:
+    # slr is NA like or NaT like
+    return (
+        is_na_like(slr)
+        or (isinstance(slr, (np.datetime64, np.timedelta64)) and np.isnat(slr))
+        or slr is pd.NaT
+    )
 
 
 def _warn_no_dask_cudf(fn):
@@ -423,9 +408,46 @@ def _all_bools_with_nulls(lhs, rhs, bool_fill_value):
     else:
         result_mask = None
 
-    result_col = column.full(
-        size=len(lhs), fill_value=bool_fill_value, dtype=cudf.dtype(np.bool_)
+    result_col = column.as_column(
+        bool_fill_value, dtype=np.dtype(np.bool_), length=len(lhs)
     )
     if result_mask is not None:
         result_col = result_col.set_mask(result_mask.as_mask())
     return result_col
+
+
+def _datetime_timedelta_find_and_replace(
+    original_column: "cudf.core.column.DatetimeColumn"
+    | "cudf.core.column.TimeDeltaColumn",
+    to_replace: Any,
+    replacement: Any,
+    all_nan: bool = False,
+) -> "cudf.core.column.DatetimeColumn" | "cudf.core.column.TimeDeltaColumn":
+    """
+    This is an internal utility to find and replace values in a datetime or
+    timedelta column. It is used by the `find_and_replace` method of
+    `DatetimeColumn` and `TimeDeltaColumn`. Centralizing the code in a single
+    as opposed to duplicating it in both classes.
+    """
+    original_col_class = type(original_column)
+    if not isinstance(to_replace, original_col_class):
+        to_replace = cudf.core.column.as_column(to_replace)
+        if to_replace.can_cast_safely(original_column.dtype):
+            to_replace = to_replace.astype(original_column.dtype)
+    if not isinstance(replacement, original_col_class):
+        replacement = cudf.core.column.as_column(replacement)
+        if replacement.can_cast_safely(original_column.dtype):
+            replacement = replacement.astype(original_column.dtype)
+    if isinstance(to_replace, original_col_class):
+        to_replace = to_replace.astype(np.dtype(np.int64))
+    if isinstance(replacement, original_col_class):
+        replacement = replacement.astype(np.dtype(np.int64))
+    try:
+        result_col = (
+            original_column.astype(np.dtype(np.int64))
+            .find_and_replace(to_replace, replacement, all_nan)
+            .astype(original_column.dtype)
+        )
+    except TypeError:
+        result_col = original_column.copy(deep=True)
+    return result_col  # type: ignore

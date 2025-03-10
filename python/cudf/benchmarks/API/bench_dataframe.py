@@ -1,9 +1,10 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION.
 
 """Benchmarks of DataFrame methods."""
 
 import string
 
+import numba.cuda
 import numpy
 import pytest
 import pytest_cases
@@ -14,6 +15,12 @@ from utils import benchmark_with_object
 @pytest.mark.parametrize("N", [100, 1_000_000])
 def bench_construction(benchmark, N):
     benchmark(cudf.DataFrame, {None: cupy.random.rand(N)})
+
+
+@pytest.mark.parametrize("N", [100, 100_000])
+@pytest.mark.pandas_incompatible
+def bench_construction_numba_device_array(benchmark, N):
+    benchmark(cudf.DataFrame, numba.cuda.to_device(numpy.ones((100, N))))
 
 
 @benchmark_with_object(cls="dataframe", dtype="float", cols=6)
@@ -178,6 +185,8 @@ def bench_nsmallest(benchmark, dataframe, num_cols_to_sort, n):
     benchmark(dataframe.nsmallest, n, by)
 
 
-@pytest_cases.parametrize_with_cases("dataframe, cond, other", prefix="where")
+@pytest_cases.parametrize_with_cases(
+    "dataframe, cond, other", prefix="where", cases="cases_dataframe"
+)
 def bench_where(benchmark, dataframe, cond, other):
     benchmark(dataframe.where, cond, other)

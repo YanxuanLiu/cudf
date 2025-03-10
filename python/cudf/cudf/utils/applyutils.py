@@ -1,14 +1,16 @@
-# Copyright (c) 2018-2023, NVIDIA CORPORATION.
+# Copyright (c) 2018-2025, NVIDIA CORPORATION.
+from __future__ import annotations
 
 import functools
-from typing import Any, Dict
+from typing import Any
 
 import cupy as cp
+import numpy as np
 from numba import cuda
 from numba.core.utils import pysignature
 
 import cudf
-from cudf import _lib as libcudf
+from cudf.core._internals import binaryop
 from cudf.core.buffer import acquire_spill_lock
 from cudf.core.column import column
 from cudf.utils import utils
@@ -108,7 +110,6 @@ def apply_chunks(
 
 @acquire_spill_lock()
 def make_aggregate_nullmask(df, columns=None, op="__and__"):
-
     out_mask = None
     for k in columns or df._data:
         col = cudf.core.dataframe.extract_col(df, k)
@@ -121,7 +122,7 @@ def make_aggregate_nullmask(df, columns=None, op="__and__"):
                 nullmask.copy(), dtype=utils.mask_dtype
             )
         else:
-            out_mask = libcudf.binaryop.binaryop(
+            out_mask = binaryop.binaryop(
                 nullmask, out_mask, op, out_mask.dtype
             )
 
@@ -159,7 +160,7 @@ class ApplyKernelCompilerBase:
         outputs = {}
         for k, dt in self.outcols.items():
             outputs[k] = column.column_empty(
-                len(df), dt, False
+                len(df), np.dtype(dt), False
             ).data_array_view(mode="write")
         # Bind argument
         args = {}
@@ -340,7 +341,7 @@ def chunk_wise_kernel(nrows, chunks, {args}):
     return kernel
 
 
-_cache: Dict[Any, Any] = dict()
+_cache: dict[Any, Any] = dict()
 
 
 @functools.wraps(_make_row_wise_kernel)

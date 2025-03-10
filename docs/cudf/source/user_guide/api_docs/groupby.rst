@@ -42,7 +42,6 @@ Computations / descriptive stats
    :toctree: api/
 
    GroupBy.bfill
-   GroupBy.backfill
    GroupBy.count
    GroupBy.cumcount
    GroupBy.cummax
@@ -63,14 +62,12 @@ Computations / descriptive stats
    GroupBy.ngroup
    GroupBy.nth
    GroupBy.nunique
-   GroupBy.pad
    GroupBy.prod
    GroupBy.shift
    GroupBy.size
    GroupBy.std
    GroupBy.sum
    GroupBy.var
-   GroupBy.corr
    GroupBy.cov
 
 The following methods are available in both ``SeriesGroupBy`` and
@@ -82,8 +79,8 @@ application to columns of a specific data type.
 .. autosummary::
    :toctree: api/
 
-   DataFrameGroupBy.backfill
    DataFrameGroupBy.bfill
+   DataFrameGroupBy.corr
    DataFrameGroupBy.count
    DataFrameGroupBy.cumcount
    DataFrameGroupBy.cummax
@@ -96,7 +93,6 @@ application to columns of a specific data type.
    DataFrameGroupBy.idxmax
    DataFrameGroupBy.idxmin
    DataFrameGroupBy.nunique
-   DataFrameGroupBy.pad
    DataFrameGroupBy.quantile
    DataFrameGroupBy.shift
    DataFrameGroupBy.size
@@ -106,5 +102,6 @@ The following methods are available only for ``SeriesGroupBy`` objects.
 .. autosummary::
    :toctree: api/
 
+   SeriesGroupBy.corr
    SeriesGroupBy.nunique
    SeriesGroupBy.unique

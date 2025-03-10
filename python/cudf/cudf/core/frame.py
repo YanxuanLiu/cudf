@@ -1,60 +1,53 @@
-# Copyright (c) 2020-2023, NVIDIA CORPORATION.
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
 
 from __future__ import annotations
 
-import copy
-import itertools
 import operator
-import pickle
 import warnings
 from collections import abc
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    MutableMapping,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Any, Literal
 
-# TODO: The `numpy` import is needed for typing purposes during doc builds
-# only, need to figure out why the `np` alias is insufficient then remove.
 import cupy
 import numpy
 import numpy as np
 import pyarrow as pa
 from typing_extensions import Self
 
+import pylibcudf as plc
+
 import cudf
-from cudf import _lib as libcudf
-from cudf._typing import Dtype
-from cudf.api.extensions import no_default
-from cudf.api.types import is_bool_dtype, is_dtype_equal, is_scalar
+
+# TODO: The `numpy` import is needed for typing purposes during doc builds
+# only, need to figure out why the `np` alias is insufficient then remove.
+from cudf.api.types import is_dtype_equal, is_scalar
+from cudf.core._compat import PANDAS_LT_300
+from cudf.core._internals import copying, search, sorting
+from cudf.core.abc import Serializable
 from cudf.core.buffer import acquire_spill_lock
 from cudf.core.column import (
     ColumnBase,
     as_column,
-    build_categorical_column,
+    column_empty,
     deserialize_columns,
     serialize_columns,
 )
+from cudf.core.column.categorical import CategoricalColumn, as_unsigned_codes
 from cudf.core.column_accessor import ColumnAccessor
 from cudf.core.mixins import BinaryOperand, Scannable
-from cudf.core.window import Rolling
 from cudf.utils import ioutils
-from cudf.utils.docutils import copy_docstring
-from cudf.utils.dtypes import can_convert_to_column, find_common_type
-from cudf.utils.utils import (
-    _array_ufunc,
-    _cudf_nvtx_annotate,
-    _warn_no_dask_cudf,
-)
+from cudf.utils.dtypes import CUDF_STRING_DTYPE, find_common_type
+from cudf.utils.performance_tracking import _performance_tracking
+from cudf.utils.utils import _array_ufunc, _warn_no_dask_cudf
+
+if TYPE_CHECKING:
+    from collections.abc import MutableMapping
+    from types import ModuleType
+
+    from cudf._typing import Dtype, DtypeObj, ScalarLike
 
 
 # TODO: It looks like Frame is missing a declaration of `copy`, need to add
-class Frame(BinaryOperand, Scannable):
+class Frame(BinaryOperand, Scannable, Serializable):
     """A collection of Column objects with an optional index.
 
     Parameters
@@ -65,14 +58,10 @@ class Frame(BinaryOperand, Scannable):
         A Frame representing the (optional) index columns.
     """
 
-    _data: "ColumnAccessor"
-
     _VALID_BINARY_OPERATIONS = BinaryOperand._SUPPORTED_BINARY_OPERATIONS
 
-    def __init__(self, data=None):
-        if data is None:
-            data = {}
-        self._data = cudf.core.column_accessor.ColumnAccessor(data)
+    def __init__(self, data: ColumnAccessor | MutableMapping[Any, ColumnBase]):
+        self._data = ColumnAccessor(data)
 
     @property
     def _num_columns(self) -> int:
@@ -80,72 +69,132 @@ class Frame(BinaryOperand, Scannable):
 
     @property
     def _num_rows(self) -> int:
-        return 0 if self._num_columns == 0 else len(self._data.columns[0])
+        return self._data.nrows
 
     @property
-    def _column_names(self) -> Tuple[Any, ...]:  # TODO: Tuple[str]?
-        return tuple(self._data.names)
+    def _column_names(self) -> tuple[Any, ...]:
+        return self._data.names
 
     @property
-    def _columns(self) -> Tuple[Any, ...]:  # TODO: Tuple[Column]?
-        return tuple(self._data.columns)
+    def _columns(self) -> tuple[ColumnBase, ...]:
+        return self._data.columns
 
     @property
-    def _dtypes(self):
-        return dict(
-            zip(self._data.names, (col.dtype for col in self._data.columns))
-        )
+    def _column_labels_and_values(
+        self,
+    ) -> abc.Iterable[tuple[abc.Hashable, ColumnBase]]:
+        return zip(self._column_names, self._columns)
 
     @property
-    def _has_nulls(self):
-        return any(col.has_nulls() for col in self._data.values())
+    def _dtypes(self) -> abc.Generator[tuple[abc.Hashable, Dtype], None, None]:
+        for label, col in self._column_labels_and_values:
+            yield label, col.dtype
 
-    @_cudf_nvtx_annotate
+    @property
+    def ndim(self) -> int:
+        raise NotImplementedError()
+
+    @_performance_tracking
     def serialize(self):
+        # TODO: See if self._data can be serialized outright
+        frames = []
         header = {
-            "type-serialized": pickle.dumps(type(self)),
-            "column_names": pickle.dumps(tuple(self._data.names)),
+            "column_label_dtype": None,
+            "dtype-is-cudf-serialized": False,
         }
-        header["columns"], frames = serialize_columns(self._columns)
+        if (label_dtype := self._data.label_dtype) is not None:
+            try:
+                header["column_label_dtype"], frames = (
+                    label_dtype.device_serialize()
+                )
+                header["dtype-is-cudf-serialized"] = True
+            except AttributeError:
+                header["column_label_dtype"] = label_dtype.str
+
+        header["columns"], column_frames = serialize_columns(self._columns)
+        column_names, column_names_numpy_type = (
+            zip(
+                *[
+                    (cname.item(), type(cname).__name__)
+                    if isinstance(cname, np.generic)
+                    else (cname, "")
+                    for cname in self._column_names
+                ]
+            )
+            if self._column_names
+            else ((), ())
+        )
+        header |= {
+            "column_names": column_names,
+            "column_names_numpy_type": column_names_numpy_type,
+            "column_rangeindex": self._data.rangeindex,
+            "column_multiindex": self._data.multiindex,
+            "column_level_names": self._data._level_names,
+        }
+        frames.extend(column_frames)
+
         return header, frames
 
     @classmethod
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def deserialize(cls, header, frames):
-        cls_deserialize = pickle.loads(header["type-serialized"])
-        column_names = pickle.loads(header["column_names"])
+        kwargs = {}
+        dtype_header = header["column_label_dtype"]
+        if header["dtype-is-cudf-serialized"]:
+            count = dtype_header["frame_count"]
+            kwargs["label_dtype"] = cls.device_deserialize(
+                header, frames[:count]
+            )
+            frames = frames[count:]
+        else:
+            kwargs["label_dtype"] = (
+                np.dtype(dtype_header) if dtype_header is not None else None
+            )
+
         columns = deserialize_columns(header["columns"], frames)
-        return cls_deserialize._from_data(dict(zip(column_names, columns)))
+        for metadata in [
+            "rangeindex",
+            "multiindex",
+            "level_names",
+        ]:
+            key = f"column_{metadata}"
+            if key in header:
+                kwargs[metadata] = header[key]
+
+        column_names = [
+            getattr(np, cntype)(cname) if cntype != "" else cname
+            for cname, cntype in zip(
+                header["column_names"], header["column_names_numpy_type"]
+            )
+        ]
+        col_accessor = ColumnAccessor(
+            data=dict(zip(column_names, columns)), **kwargs
+        )
+        return cls._from_data(col_accessor)
 
     @classmethod
-    @_cudf_nvtx_annotate
-    def _from_data(cls, data: MutableMapping):
+    @_performance_tracking
+    def _from_data(cls, data: MutableMapping) -> Self:
+        """
+        Construct cls from a ColumnAccessor-like mapping.
+        """
         obj = cls.__new__(cls)
         Frame.__init__(obj, data)
         return obj
 
-    @_cudf_nvtx_annotate
-    def _from_data_like_self(self, data: MutableMapping):
+    @_performance_tracking
+    def _from_data_like_self(self, data: MutableMapping) -> Self:
+        """
+        Return type(self) from a ColumnAccessor-like mapping but
+        with the external properties, e.g. .index, .name, of self.
+        """
         return self._from_data(data)
 
-    @classmethod
-    @_cudf_nvtx_annotate
-    def _from_columns(
-        cls,
-        columns: List[ColumnBase],
-        column_names: abc.Iterable[str],
-    ):
-        """Construct a `Frame` object from a list of columns."""
-        data = {name: columns[i] for i, name in enumerate(column_names)}
-        return cls._from_data(data)
-
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _from_columns_like_self(
         self,
-        columns: List[ColumnBase],
-        column_names: Optional[abc.Iterable[str]] = None,
-        *,
-        override_dtypes: Optional[abc.Iterable[Optional[Dtype]]] = None,
+        columns: list[ColumnBase],
+        column_names: abc.Iterable[str] | None = None,
     ):
         """Construct a Frame from a list of columns with metadata from self.
 
@@ -153,15 +202,16 @@ class Frame(BinaryOperand, Scannable):
         """
         if column_names is None:
             column_names = self._column_names
-        frame = self.__class__._from_columns(columns, column_names)
-        return frame._copy_type_metadata(self, override_dtypes=override_dtypes)
+        data = dict(zip(column_names, columns))
+        frame = self.__class__._from_data(data)
+        return frame._copy_type_metadata(self)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _mimic_inplace(
         self, result: Self, inplace: bool = False
-    ) -> Optional[Self]:
+    ) -> Self | None:
         if inplace:
-            for col in self._data:
+            for col in self._column_names:
                 if col in result._data:
                     self._data[col]._mimic_inplace(
                         result._data[col], inplace=True
@@ -172,8 +222,8 @@ class Frame(BinaryOperand, Scannable):
             return result
 
     @property
-    @_cudf_nvtx_annotate
-    def size(self):
+    @_performance_tracking
+    def size(self) -> int:
         """
         Return the number of elements in the underlying data.
 
@@ -221,12 +271,12 @@ class Frame(BinaryOperand, Scannable):
 
         >>> index = cudf.Index([])
         >>> index
-        Float64Index([], dtype='float64')
+        Index([], dtype='float64')
         >>> index.size
         0
         >>> index = cudf.Index([1, 2, 3, 10])
         >>> index
-        Int64Index([1, 2, 3, 10], dtype='int64')
+        Index([1, 2, 3, 10], dtype='int64')
         >>> index.size
         4
 
@@ -249,7 +299,6 @@ class Frame(BinaryOperand, Scannable):
         """
         return self._num_columns * self._num_rows
 
-    @_cudf_nvtx_annotate
     def memory_usage(self, deep=False):
         """Return the memory usage of an object.
 
@@ -265,28 +314,23 @@ class Frame(BinaryOperand, Scannable):
         """
         raise NotImplementedError
 
-    @_cudf_nvtx_annotate
-    def __len__(self):
+    @_performance_tracking
+    def __len__(self) -> int:
         return self._num_rows
 
-    @_cudf_nvtx_annotate
-    def astype(self, dtype, copy=False, **kwargs):
-        result_data = {}
-        for col_name, col in self._data.items():
-            dt = dtype.get(col_name, col.dtype)
-            if not is_dtype_equal(dt, col.dtype):
-                result_data[col_name] = col.astype(dt, copy=copy, **kwargs)
-            else:
-                result_data[col_name] = col.copy() if copy else col
-
-        return ColumnAccessor._create_unsafe(
-            data=result_data,
-            multiindex=self._data.multiindex,
-            level_names=self._data.level_names,
+    @_performance_tracking
+    def astype(
+        self, dtype: dict[abc.Hashable, DtypeObj], copy: bool = False
+    ) -> Self:
+        casted = (
+            col.astype(dtype.get(col_name, col.dtype), copy=copy)
+            for col_name, col in self._column_labels_and_values
         )
+        ca = self._data._from_columns_like_self(casted, verify=False)
+        return self._from_data_like_self(ca)
 
-    @_cudf_nvtx_annotate
-    def equals(self, other):
+    @_performance_tracking
+    def equals(self, other) -> bool:
         """
         Test whether two objects contain the same elements.
 
@@ -346,31 +390,26 @@ class Frame(BinaryOperand, Scannable):
         """
         if self is other:
             return True
-        if (
-            other is None
-            or not isinstance(other, type(self))
-            or len(self) != len(other)
-        ):
+        if not isinstance(other, type(self)) or len(self) != len(other):
             return False
 
         return all(
             self_col.equals(other_col, check_dtypes=True)
-            for self_col, other_col in zip(
-                self._data.values(), other._data.values()
-            )
+            for self_col, other_col in zip(self._columns, other._columns)
         )
 
-    @_cudf_nvtx_annotate
-    def _get_columns_by_label(self, labels, *, downcast=False) -> Self:
+    @_performance_tracking
+    def _get_columns_by_label(self, labels) -> Self:
         """
-        Returns columns of the Frame specified by `labels`
+        Returns columns of the Frame specified by `labels`.
 
+        Akin to cudf.DataFrame(...).loc[:, labels]
         """
-        return self.__class__._from_data(self._data.select_by_label(labels))
+        return self._from_data_like_self(self._data.select_by_label(labels))
 
     @property
-    @_cudf_nvtx_annotate
-    def values(self):
+    @_performance_tracking
+    def values(self) -> cupy.ndarray:
         """
         Return a CuPy representation of the DataFrame.
 
@@ -385,8 +424,8 @@ class Frame(BinaryOperand, Scannable):
         return self.to_cupy()
 
     @property
-    @_cudf_nvtx_annotate
-    def values_host(self):
+    @_performance_tracking
+    def values_host(self) -> np.ndarray:
         """
         Return a NumPy representation of the data.
 
@@ -400,8 +439,8 @@ class Frame(BinaryOperand, Scannable):
         """
         return self.to_numpy()
 
-    @_cudf_nvtx_annotate
-    def __array__(self, dtype=None):
+    @_performance_tracking
+    def __array__(self, dtype=None, copy=None):
         raise TypeError(
             "Implicit conversion to a host NumPy array via __array__ is not "
             "allowed, To explicitly construct a GPU matrix, consider using "
@@ -409,61 +448,73 @@ class Frame(BinaryOperand, Scannable):
             "using .to_numpy()."
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def __arrow_array__(self, type=None):
         raise TypeError(
             "Implicit conversion to a host PyArrow object via __arrow_array__ "
             "is not allowed. Consider using .to_arrow()"
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _to_array(
         self,
-        get_column_values: Callable,
-        make_empty_matrix: Callable,
-        dtype: Union[Dtype, None] = None,
+        get_array: abc.Callable,
+        module: ModuleType,
+        copy: bool,
+        dtype: Dtype | None = None,
         na_value=None,
-    ) -> Union[cupy.ndarray, np.ndarray]:
+    ) -> cupy.ndarray | numpy.ndarray:
         # Internal function to implement to_cupy and to_numpy, which are nearly
         # identical except for the attribute they access to generate values.
 
-        def get_column_values_na(col):
+        def to_array(
+            col: ColumnBase, dtype: np.dtype
+        ) -> cupy.ndarray | numpy.ndarray:
             if na_value is not None:
                 col = col.fillna(na_value)
-            return get_column_values(col)
+            if isinstance(col.dtype, cudf.CategoricalDtype):
+                col = col._get_decategorized_column()  # type: ignore[attr-defined]
+            array = get_array(col)
+            casted_array = module.asarray(array, dtype=dtype)
+            if copy and casted_array is array:
+                # Don't double copy after asarray
+                casted_array = casted_array.copy()
+            return casted_array
 
-        # Early exit for an empty Frame.
         ncol = self._num_columns
         if ncol == 0:
-            return make_empty_matrix(
-                shape=(len(self), ncol), dtype=np.dtype("float64"), order="F"
+            return module.empty(
+                shape=(len(self), ncol),
+                dtype=numpy.dtype("float64"),
+                order="F",
             )
 
         if dtype is None:
-            dtypes = [col.dtype for col in self._data.values()]
-            for dtype in dtypes:
-                if isinstance(
-                    dtype,
-                    (
-                        cudf.ListDtype,
-                        cudf.core.dtypes.DecimalDtype,
-                        cudf.StructDtype,
-                    ),
-                ):
-                    raise NotImplementedError(
-                        f"{dtype} cannot be exposed as a cupy array"
-                    )
-            dtype = find_common_type(dtypes)
+            if ncol == 1:
+                dtype = next(self._dtypes)[1]
+            else:
+                dtype = find_common_type([dtype for _, dtype in self._dtypes])
 
-        matrix = make_empty_matrix(
-            shape=(len(self), ncol), dtype=dtype, order="F"
-        )
-        for i, col in enumerate(self._data.values()):
-            # TODO: col.values may fail if there is nullable data or an
-            # unsupported dtype. We may want to catch and provide a more
-            # suitable error.
-            matrix[:, i] = get_column_values_na(col)
-        return matrix
+            if isinstance(dtype, cudf.CategoricalDtype):
+                dtype = dtype.categories.dtype
+
+            if not isinstance(dtype, numpy.dtype):
+                raise NotImplementedError(
+                    f"{dtype} cannot be exposed as an array"
+                )
+
+        if self.ndim == 1:
+            return to_array(self._columns[0], dtype)
+        else:
+            matrix = module.empty(
+                shape=(len(self), ncol), dtype=dtype, order="F"
+            )
+            for i, col in enumerate(self._columns):
+                # TODO: col.values may fail if there is nullable data or an
+                # unsupported dtype. We may want to catch and provide a more
+                # suitable error.
+                matrix[:, i] = to_array(col, dtype)
+            return matrix
 
     # TODO: As of now, calling cupy.asarray is _much_ faster than calling
     # to_cupy. We should investigate the reasons why and whether we can provide
@@ -471,10 +522,10 @@ class Frame(BinaryOperand, Scannable):
     # particular, we need to benchmark how much of the overhead is coming from
     # (potentially unavoidable) local copies in to_cupy and how much comes from
     # inefficiencies in the implementation.
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def to_cupy(
         self,
-        dtype: Union[Dtype, None] = None,
+        dtype: Dtype | None = None,
         copy: bool = False,
         na_value=None,
     ) -> cupy.ndarray:
@@ -498,18 +549,17 @@ class Frame(BinaryOperand, Scannable):
         cupy.ndarray
         """
         return self._to_array(
-            (lambda col: col.values.copy())
-            if copy
-            else (lambda col: col.values),
-            cupy.empty,
+            lambda col: col.values,
+            cupy,
+            copy,
             dtype,
             na_value,
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def to_numpy(
         self,
-        dtype: Union[Dtype, None] = None,
+        dtype: Dtype | None = None,
         copy: bool = True,
         na_value=None,
     ) -> numpy.ndarray:
@@ -538,11 +588,11 @@ class Frame(BinaryOperand, Scannable):
             )
 
         return self._to_array(
-            (lambda col: col.values_host), np.empty, dtype, na_value
+            lambda col: col.values_host, numpy, copy, dtype, na_value
         )
 
-    @_cudf_nvtx_annotate
-    def where(self, cond, other=None, inplace=False):
+    @_performance_tracking
+    def where(self, cond, other=None, inplace: bool = False) -> Self | None:
         """
         Replace values where the condition is False.
 
@@ -595,6 +645,8 @@ class Frame(BinaryOperand, Scannable):
         dtype: int64
 
         .. pandas-compat::
+            :meth:`pandas.DataFrame.where`, :meth:`pandas.Series.where`
+
             Note that ``where`` treats missing values as falsy,
             in parallel with pandas treatment of nullable data:
 
@@ -612,119 +664,15 @@ class Frame(BinaryOperand, Scannable):
         """
         raise NotImplementedError
 
-    @_cudf_nvtx_annotate
-    def mask(self, cond, other=None, inplace=False):
-        """
-        Replace values where the condition is True.
-
-        Parameters
-        ----------
-        cond : bool Series/DataFrame, array-like
-            Where cond is False, keep the original value.
-            Where True, replace with corresponding value from other.
-            Callables are not supported.
-        other: scalar, list of scalars, Series/DataFrame
-            Entries where cond is True are replaced with
-            corresponding value from other. Callables are not
-            supported. Default is None.
-
-            DataFrame expects only Scalar or array like with scalars or
-            dataframe with same dimension as self.
-
-            Series expects only scalar or series like with same length
-        inplace : bool, default False
-            Whether to perform the operation in place on the data.
-
-        Returns
-        -------
-        Same type as caller
-
-        Examples
-        --------
-        >>> import cudf
-        >>> df = cudf.DataFrame({"A":[1, 4, 5], "B":[3, 5, 8]})
-        >>> df.mask(df % 2 == 0, [-1, -1])
-           A  B
-        0  1  3
-        1 -1  5
-        2  5 -1
-
-        >>> ser = cudf.Series([4, 3, 2, 1, 0])
-        >>> ser.mask(ser > 2, 10)
-        0    10
-        1    10
-        2     2
-        3     1
-        4     0
-        dtype: int64
-        >>> ser.mask(ser > 2)
-        0    <NA>
-        1    <NA>
-        2       2
-        3       1
-        4       0
-        dtype: int64
-        """
-
-        if not hasattr(cond, "__invert__"):
-            # We Invert `cond` below and call `where`, so
-            # making sure the object supports
-            # `~`(inversion) operator or `__invert__` method
-            cond = cupy.asarray(cond)
-
-        return self.where(cond=~cond, other=other, inplace=inplace)
-
-    @_cudf_nvtx_annotate
-    def pipe(self, func, *args, **kwargs):
-        """
-        Apply ``func(self, *args, **kwargs)``.
-
-        Parameters
-        ----------
-        func : function
-            Function to apply to the Series/DataFrame/Index.
-            ``args``, and ``kwargs`` are passed into ``func``.
-            Alternatively a ``(callable, data_keyword)`` tuple where
-            ``data_keyword`` is a string indicating the keyword of
-            ``callable`` that expects the Series/DataFrame/Index.
-        args : iterable, optional
-            Positional arguments passed into ``func``.
-        kwargs : mapping, optional
-            A dictionary of keyword arguments passed into ``func``.
-
-        Returns
-        -------
-        object : the return type of ``func``.
-
-        Examples
-        --------
-        Use ``.pipe`` when chaining together functions that expect
-        Series, DataFrames or GroupBy objects. Instead of writing
-
-        >>> func(g(h(df), arg1=a), arg2=b, arg3=c)
-
-        You can write
-
-        >>> (df.pipe(h)
-        ...    .pipe(g, arg1=a)
-        ...    .pipe(func, arg2=b, arg3=c)
-        ... )
-
-        If you have a function that takes the data as (say) the second
-        argument, pass a tuple indicating which keyword expects the
-        data. For example, suppose ``f`` takes its data as ``arg2``:
-
-        >>> (df.pipe(h)
-        ...    .pipe(g, arg1=a)
-        ...    .pipe((func, 'arg2'), arg1=a, arg3=c)
-        ...  )
-        """
-        return cudf.core.common.pipe(self, func, *args, **kwargs)
-
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def fillna(
-        self, value=None, method=None, axis=None, inplace=False, limit=None
-    ):
+        self,
+        value: None | ScalarLike | cudf.Series = None,
+        method: Literal["ffill", "bfill", "pad", "backfill", None] = None,
+        axis=None,
+        inplace: bool = False,
+        limit=None,
+    ) -> Self | None:
         """Fill null values with ``value`` or specified ``method``.
 
         Parameters
@@ -734,12 +682,14 @@ class Frame(BinaryOperand, Scannable):
             are filled with values in corresponding indices.
             A dict can be used to provide different values to fill nulls
             in different columns. Cannot be used with ``method``.
-
         method : {'ffill', 'bfill'}, default None
             Method to use for filling null values in the dataframe or series.
             `ffill` propagates the last non-null values forward to the next
             non-null value. `bfill` propagates backward with the next non-null
             value. Cannot be used with ``value``.
+
+            .. deprecated:: 24.04
+                `method` is deprecated.
 
         Returns
         -------
@@ -829,6 +779,16 @@ class Frame(BinaryOperand, Scannable):
             raise ValueError("Cannot specify both 'value' and 'method'.")
 
         if method:
+            # Do not remove until pandas 3.0 support is added.
+            assert PANDAS_LT_300, (
+                "Need to drop after pandas-3.0 support is added."
+            )
+            warnings.warn(
+                f"{type(self).__name__}.fillna with 'method' is "
+                "deprecated and will raise in a future version. "
+                "Use obj.ffill() or obj.bfill() instead.",
+                FutureWarning,
+            )
             if method not in {"ffill", "bfill", "pad", "backfill"}:
                 raise NotImplementedError(
                     f"Fill method {method} is not supported"
@@ -838,125 +798,88 @@ class Frame(BinaryOperand, Scannable):
             elif method == "backfill":
                 method = "bfill"
 
-        # TODO: This logic should be handled in different subclasses since
-        # different Frames support different types of values.
-        if isinstance(value, cudf.Series):
-            value = value.reindex(self._data.names)
-        elif isinstance(value, cudf.DataFrame):
-            if not self.index.equals(value.index):
-                value = value.reindex(self.index)
-            else:
-                value = value
-        elif not isinstance(value, abc.Mapping):
-            value = {name: copy.deepcopy(value) for name in self._data.names}
-        else:
-            value = {
-                key: value.reindex(self.index)
-                if isinstance(value, cudf.Series)
-                else value
-                for key, value in value.items()
-            }
+        if is_scalar(value):
+            value = {name: value for name in self._column_names}
+        elif not isinstance(value, (abc.Mapping, cudf.Series)):
+            raise TypeError(
+                f'"value" parameter must be a scalar, dict '
+                f"or Series, but you passed a "
+                f'"{type(value).__name__}"'
+            )
 
-        filled_data = {}
-        for col_name, col in self._data.items():
-            if col_name in value and method is None:
-                replace_val = value[col_name]
-            else:
-                replace_val = None
-            should_fill = (
-                col_name in value
-                and col.contains_na_entries
-                and not libcudf.scalar._is_null_host_scalar(replace_val)
-            ) or method is not None
-            if should_fill:
-                filled_data[col_name] = col.fillna(replace_val, method)
-            else:
-                filled_data[col_name] = col.copy(deep=True)
+        filled_columns = [
+            col.fillna(value[name], method) if name in value else col.copy()
+            for name, col in self._column_labels_and_values
+        ]
 
         return self._mimic_inplace(
-            self._from_data(
-                data=ColumnAccessor._create_unsafe(
-                    data=filled_data,
-                    multiindex=self._data.multiindex,
-                    level_names=self._data.level_names,
+            self._from_data_like_self(
+                self._data._from_columns_like_self(
+                    filled_columns, verify=False
                 )
             ),
             inplace=inplace,
         )
 
-    @_cudf_nvtx_annotate
-    def _drop_column(self, name):
-        """Drop a column by *name*"""
-        if name not in self._data:
-            raise KeyError(f"column '{name}' does not exist")
-        del self._data[name]
+    def _pandas_repr_compatible(self) -> Self:
+        """Return Self but with columns prepared for a pandas-like repr."""
+        columns = (col._prep_pandas_compat_repr() for col in self._columns)
+        return self._from_data_like_self(
+            self._data._from_columns_like_self(columns, verify=False)
+        )
 
-    @_cudf_nvtx_annotate
-    def _drop_na_columns(self, how="any", subset=None, thresh=None):
-        """
-        Drop columns containing nulls
-        """
-        out_cols = []
+    @_performance_tracking
+    def _drop_column(
+        self, name: abc.Hashable, errors: Literal["ignore", "raise"] = "raise"
+    ) -> None:
+        """Drop a column by *name* inplace."""
+        try:
+            del self._data[name]
+        except KeyError as err:
+            if errors != "ignore":
+                raise KeyError(f"column '{name}' does not exist") from err
 
-        if subset is None:
-            df = self
-        else:
-            df = self.take(subset)
-
-        if thresh is None:
-            if how == "all":
-                thresh = 1
-            else:
-                thresh = len(df)
-
-        for name, col in df._data.items():
-            try:
-                check_col = col.nans_to_nulls()
-            except AttributeError:
-                check_col = col
-            no_threshold_valid_count = (
-                len(col) - check_col.null_count
-            ) < thresh
-            if no_threshold_valid_count:
-                continue
-            out_cols.append(name)
-
-        return self[out_cols]
-
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _quantile_table(
         self,
-        q,
-        interpolation="LINEAR",
-        is_sorted=False,
+        q: float,
+        interpolation: Literal[
+            "LINEAR", "LOWER", "HIGHER", "MIDPOINT", "NEAREST"
+        ] = "LINEAR",
+        is_sorted: bool = False,
         column_order=(),
         null_precedence=(),
     ):
-        interpolation = libcudf.types.Interpolation[interpolation]
+        interpolation = plc.types.Interpolation[interpolation]
 
-        is_sorted = libcudf.types.Sorted["YES" if is_sorted else "NO"]
+        is_sorted = plc.types.Sorted["YES" if is_sorted else "NO"]
 
-        column_order = [libcudf.types.Order[key] for key in column_order]
+        column_order = [plc.types.Order[key] for key in column_order]
 
-        null_precedence = [
-            libcudf.types.NullOrder[key] for key in null_precedence
-        ]
+        null_precedence = [plc.types.NullOrder[key] for key in null_precedence]
 
-        return self._from_columns_like_self(
-            libcudf.quantiles.quantile_table(
-                [*self._columns],
+        with acquire_spill_lock():
+            plc_table = plc.quantiles.quantiles(
+                plc.Table(
+                    [c.to_pylibcudf(mode="read") for c in self._columns]
+                ),
                 q,
                 interpolation,
                 is_sorted,
                 column_order,
                 null_precedence,
-            ),
+            )
+            columns = [
+                ColumnBase.from_pylibcudf(col) for col in plc_table.columns()
+            ]
+        return self._from_columns_like_self(
+            columns,
             column_names=self._column_names,
         )
 
     @classmethod
-    @_cudf_nvtx_annotate
-    def from_arrow(cls, data):
+    @_performance_tracking
+    def from_arrow(cls, data: pa.Table) -> Self:
         """Convert from PyArrow Table to Frame
 
         Parameters
@@ -1006,6 +929,13 @@ class Frame(BinaryOperand, Scannable):
         # so handling indices and dictionary as two different columns.
         # This needs be removed once we have hooked libcudf dictionary32
         # with categorical.
+        if any(
+            isinstance(x.type, pa.DictionaryType)
+            and isinstance(x, pa.ChunkedArray)
+            for x in data
+        ):
+            data = data.combine_chunks()
+
         dict_indices = {}
         dict_dictionaries = {}
         dict_ordered = {}
@@ -1026,31 +956,35 @@ class Frame(BinaryOperand, Scannable):
         if len(dict_indices):
             dict_indices_table = pa.table(dict_indices)
             data = data.drop(dict_indices_table.column_names)
-            indices_columns = libcudf.interop.from_arrow(dict_indices_table)
+            plc_indices = plc.interop.from_arrow(dict_indices_table)
             # as dictionary size can vary, it can't be a single table
             cudf_dictionaries_columns = {
                 name: ColumnBase.from_arrow(dict_dictionaries[name])
                 for name in dict_dictionaries.keys()
             }
 
-            cudf_category_frame = {
-                name: build_categorical_column(
-                    cudf_dictionaries_columns[name],
-                    codes,
-                    mask=codes.base_mask,
+            for name, plc_codes in zip(
+                dict_indices_table.column_names, plc_indices.columns()
+            ):
+                codes = ColumnBase.from_pylibcudf(plc_codes)
+                categories = cudf_dictionaries_columns[name]
+                codes = as_unsigned_codes(len(categories), codes)  # type: ignore[arg-type]
+                cudf_category_frame[name] = CategoricalColumn(
+                    data=None,
                     size=codes.size,
-                    ordered=dict_ordered[name],
+                    dtype=cudf.CategoricalDtype(
+                        categories=categories,
+                        ordered=dict_ordered[name],
+                    ),
+                    mask=codes.base_mask,
+                    children=(codes,),
                 )
-                for name, codes in zip(
-                    dict_indices_table.column_names, indices_columns
-                )
-            }
 
         # Handle non-dict arrays
         cudf_non_category_frame = {
-            name: col
-            for name, col in zip(
-                data.column_names, libcudf.interop.from_arrow(data)
+            name: ColumnBase.from_pylibcudf(plc_col)
+            for name, plc_col in zip(
+                data.column_names, plc.interop.from_arrow(data).columns()
             )
         }
 
@@ -1067,7 +1001,11 @@ class Frame(BinaryOperand, Scannable):
                 # of column is 0 (i.e., empty) then we will have an
                 # int8 column in result._data[name] returned by libcudf,
                 # which needs to be type-casted to 'category' dtype.
-                result[name] = result[name].as_categorical_column("category")
+                result[name] = result[name].astype(
+                    cudf.CategoricalDtype(
+                        categories=column_empty(0, dtype=result[name].dtype)
+                    )
+                )
             elif (
                 pandas_dtypes.get(name) == "empty"
                 and np_dtypes.get(name) == "object"
@@ -1076,7 +1014,7 @@ class Frame(BinaryOperand, Scannable):
                 # is specified as 'empty' and np_dtypes as 'object',
                 # hence handling this special case to type-cast the empty
                 # float column to str column.
-                result[name] = result[name].as_string_column(cudf.dtype("str"))
+                result[name] = result[name].astype(CUDF_STRING_DTYPE)
             elif name in data.column_names and isinstance(
                 data[name].type,
                 (
@@ -1108,8 +1046,8 @@ class Frame(BinaryOperand, Scannable):
 
         return cls._from_data({name: result[name] for name in column_names})
 
-    @_cudf_nvtx_annotate
-    def to_arrow(self):
+    @_performance_tracking
+    def to_arrow(self) -> pa.Table:
         """
         Convert to arrow Table
 
@@ -1129,53 +1067,28 @@ class Frame(BinaryOperand, Scannable):
         index: [[1,2,3]]
         """
         return pa.Table.from_pydict(
-            {str(name): col.to_arrow() for name, col in self._data.items()}
+            {
+                str(name): col.to_arrow()
+                for name, col in self._column_labels_and_values
+            }
         )
 
-    @_cudf_nvtx_annotate
-    def _positions_from_column_names(self, column_names):
-        """Map each column name into their positions in the frame.
-
-        The order of indices returned corresponds to the column order in this
-        Frame.
-        """
-        return [
-            i
-            for i, name in enumerate(self._column_names)
-            if name in set(column_names)
-        ]
-
-    @_cudf_nvtx_annotate
-    def _copy_type_metadata(
-        self,
-        other: Self,
-        *,
-        override_dtypes: Optional[abc.Iterable[Optional[Dtype]]] = None,
-    ) -> Self:
+    @_performance_tracking
+    def _copy_type_metadata(self: Self, other: Self) -> Self:
         """
         Copy type metadata from each column of `other` to the corresponding
         column of `self`.
 
-        If override_dtypes is provided, any non-None entry
-        will be used in preference to the relevant column of other to
-        provide the new dtype.
-
         See `ColumnBase._with_type_metadata` for more information.
         """
-        if override_dtypes is None:
-            override_dtypes = itertools.repeat(None)
-        dtypes = (
-            dtype if dtype is not None else col.dtype
-            for (dtype, col) in zip(override_dtypes, other._data.values())
-        )
-        for (name, col), dtype in zip(self._data.items(), dtypes):
-            self._data.set_by_label(
-                name, col._with_type_metadata(dtype), validate=False
-            )
+        for (name, col), (_, dtype) in zip(
+            self._column_labels_and_values, other._dtypes
+        ):
+            self._data.set_by_label(name, col._with_type_metadata(dtype))
 
         return self
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def isna(self):
         """
         Identify missing values.
@@ -1206,7 +1119,7 @@ class Frame(BinaryOperand, Scannable):
         >>> import cudf
         >>> import numpy as np
         >>> import pandas as pd
-        >>> df = cudf.DataFrame({'age': [5, 6, np.NaN],
+        >>> df = cudf.DataFrame({'age': [5, 6, np.nan],
         ...                    'born': [pd.NaT, pd.Timestamp('1939-05-27'),
         ...                             pd.Timestamp('1940-04-25')],
         ...                    'name': ['Alfred', 'Batman', ''],
@@ -1224,7 +1137,7 @@ class Frame(BinaryOperand, Scannable):
 
         Show which entries in a Series are NA.
 
-        >>> ser = cudf.Series([5, 6, np.NaN, np.inf, -np.inf])
+        >>> ser = cudf.Series([5, 6, np.nan, np.inf, -np.inf])
         >>> ser
         0     5.0
         1     6.0
@@ -1242,19 +1155,21 @@ class Frame(BinaryOperand, Scannable):
 
         Show which entries in an Index are NA.
 
-        >>> idx = cudf.Index([1, 2, None, np.NaN, 0.32, np.inf])
+        >>> idx = cudf.Index([1, 2, None, np.nan, 0.32, np.inf])
         >>> idx
-        Float64Index([1.0, 2.0, <NA>, <NA>, 0.32, Inf], dtype='float64')
+        Index([1.0, 2.0, <NA>, <NA>, 0.32, Inf], dtype='float64')
         >>> idx.isna()
         array([False, False,  True,  True, False, False])
         """
         data_columns = (col.isnull() for col in self._columns)
-        return self._from_data_like_self(zip(self._column_names, data_columns))
+        return self._from_data_like_self(
+            self._data._from_columns_like_self(data_columns)
+        )
 
     # Alias for isna
     isnull = isna
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def notna(self):
         """
         Identify non-missing values.
@@ -1285,7 +1200,7 @@ class Frame(BinaryOperand, Scannable):
         >>> import cudf
         >>> import numpy as np
         >>> import pandas as pd
-        >>> df = cudf.DataFrame({'age': [5, 6, np.NaN],
+        >>> df = cudf.DataFrame({'age': [5, 6, np.nan],
         ...                    'born': [pd.NaT, pd.Timestamp('1939-05-27'),
         ...                             pd.Timestamp('1940-04-25')],
         ...                    'name': ['Alfred', 'Batman', ''],
@@ -1303,7 +1218,7 @@ class Frame(BinaryOperand, Scannable):
 
         Show which entries in a Series are NA.
 
-        >>> ser = cudf.Series([5, 6, np.NaN, np.inf, -np.inf])
+        >>> ser = cudf.Series([5, 6, np.nan, np.inf, -np.inf])
         >>> ser
         0     5.0
         1     6.0
@@ -1321,22 +1236,29 @@ class Frame(BinaryOperand, Scannable):
 
         Show which entries in an Index are NA.
 
-        >>> idx = cudf.Index([1, 2, None, np.NaN, 0.32, np.inf])
+        >>> idx = cudf.Index([1, 2, None, np.nan, 0.32, np.inf])
         >>> idx
-        Float64Index([1.0, 2.0, <NA>, <NA>, 0.32, Inf], dtype='float64')
+        Index([1.0, 2.0, <NA>, <NA>, 0.32, Inf], dtype='float64')
         >>> idx.notna()
         array([ True,  True, False, False,  True,  True])
         """
         data_columns = (col.notnull() for col in self._columns)
-        return self._from_data_like_self(zip(self._column_names, data_columns))
+        return self._from_data_like_self(
+            self._data._from_columns_like_self(data_columns)
+        )
 
     # Alias for notna
     notnull = notna
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def searchsorted(
-        self, values, side="left", ascending=True, na_position="last"
-    ):
+        self,
+        values,
+        side: Literal["left", "right"] = "left",
+        sorter=None,
+        ascending: bool = True,
+        na_position: Literal["first", "last"] = "last",
+    ) -> ScalarLike | cupy.ndarray:
         """Find indices where elements should be inserted to maintain order
 
         Parameters
@@ -1346,6 +1268,10 @@ class Frame(BinaryOperand, Scannable):
         side : str {'left', 'right'} optional, default 'left'
             If 'left', the index of the first suitable location found is given
             If 'right', return the last such index
+        sorter : 1-D array-like, optional
+            Optional array of integer indices that sort `self` into ascending
+            order. They are typically the result of ``np.argsort``.
+            Currently not supported.
         ascending : bool optional, default True
             Sorted Frame is in ascending order (otherwise descending)
         na_position : str {'last', 'first'} optional, default 'last'
@@ -1392,10 +1318,12 @@ class Frame(BinaryOperand, Scannable):
         >>> df.searchsorted(values_df, ascending=False)
         array([4, 4, 4, 0], dtype=int32)
         """
-        # Call libcudf search_sorted primitive
+        # Note: pandas.DataFrame does not support searchsorted
 
         if na_position not in {"first", "last"}:
             raise ValueError(f"invalid na_position: {na_position}")
+        elif sorter is not None:
+            raise NotImplementedError("sorter is currently not supported.")
 
         scalar_flag = None
         if is_scalar(values):
@@ -1427,12 +1355,14 @@ class Frame(BinaryOperand, Scannable):
             for val, common_dtype in zip(values, common_dtype_list)
         ]
 
-        outcol = libcudf.search.search_sorted(
-            sources,
-            values,
-            side,
-            ascending=ascending,
-            na_position=na_position,
+        outcol = ColumnBase.from_pylibcudf(
+            search.search_sorted(
+                sources,
+                values,
+                side,
+                ascending=ascending,
+                na_position=na_position,
+            )
         )
 
         # Return result as cupy array if the values is non-scalar
@@ -1443,7 +1373,7 @@ class Frame(BinaryOperand, Scannable):
         else:
             return result
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def argsort(
         self,
         by=None,
@@ -1452,7 +1382,7 @@ class Frame(BinaryOperand, Scannable):
         order=None,
         ascending=True,
         na_position="last",
-    ):
+    ) -> cupy.ndarray:
         """Return the integer indices that would sort the Series values.
 
         Parameters
@@ -1510,7 +1440,7 @@ class Frame(BinaryOperand, Scannable):
         >>> idx = cudf.Index([3, 1, 2])
         >>> idx.argsort()
         array([1, 2, 0], dtype=int32)
-        """  # noqa: E501
+        """
         if na_position not in {"first", "last"}:
             raise ValueError(f"invalid na_position: {na_position}")
         if kind != "quicksort":
@@ -1530,134 +1460,73 @@ class Frame(BinaryOperand, Scannable):
             by=by, ascending=ascending, na_position=na_position
         ).values
 
-    @_cudf_nvtx_annotate
-    def _get_sorted_inds(self, by=None, ascending=True, na_position="last"):
+    @_performance_tracking
+    def _get_sorted_inds(
+        self,
+        by=None,
+        ascending=True,
+        na_position: Literal["first", "last"] = "last",
+    ) -> ColumnBase:
         """
         Get the indices required to sort self according to the columns
         specified in by.
         """
+        if by is None:
+            to_sort = self._columns
+        else:
+            to_sort = self._get_columns_by_label(list(by))._columns
 
-        to_sort = [
-            *(
-                self
-                if by is None
-                else self._get_columns_by_label(list(by), downcast=False)
-            )._columns
-        ]
+        if is_scalar(ascending):
+            ascending_lst = [ascending] * len(to_sort)
+        else:
+            ascending_lst = list(ascending)
 
-        # If given a scalar need to construct a sequence of length # of columns
-        if np.isscalar(ascending):
-            ascending = [ascending] * len(to_sort)
-
-        return libcudf.sort.order_by(
-            to_sort,
-            ascending,
-            na_position,
-            stable=True,
+        return ColumnBase.from_pylibcudf(
+            sorting.order_by(
+                list(to_sort),
+                ascending_lst,
+                na_position,
+                stable=True,
+            )
         )
 
-    @_cudf_nvtx_annotate
-    def abs(self):
-        """
-        Return a Series/DataFrame with absolute numeric value of each element.
-
-        This function only applies to elements that are all numeric.
-
-        Returns
-        -------
-        DataFrame/Series
-            Absolute value of each element.
-
-        Examples
-        --------
-        Absolute numeric values in a Series
-
-        >>> s = cudf.Series([-1.10, 2, -3.33, 4])
-        >>> s.abs()
-        0    1.10
-        1    2.00
-        2    3.33
-        3    4.00
-        dtype: float64
-        """
-        return self._unaryop("abs")
-
-    @_cudf_nvtx_annotate
-    def _is_sorted(self, ascending=None, null_position=None):
-        """
-        Returns a boolean indicating whether the data of the Frame are sorted
-        based on the parameters given. Does not account for the index.
-
-        Parameters
-        ----------
-        self : Frame
-            Frame whose columns are to be checked for sort order
-        ascending : None or list-like of booleans
-            None or list-like of boolean values indicating expected sort order
-            of each column. If list-like, size of list-like must be
-            len(columns). If None, all columns expected sort order is set to
-            ascending. False (0) - ascending, True (1) - descending.
-        null_position : None or list-like of booleans
-            None or list-like of boolean values indicating desired order of
-            nulls compared to other elements. If list-like, size of list-like
-            must be len(columns). If None, null order is set to before. False
-            (0) - before, True (1) - after.
-
-        Returns
-        -------
-        returns : boolean
-            Returns True, if sorted as expected by ``ascending`` and
-            ``null_position``, False otherwise.
-        """
-        if ascending is not None and not cudf.api.types.is_list_like(
-            ascending
-        ):
-            raise TypeError(
-                f"Expected a list-like or None for `ascending`, got "
-                f"{type(ascending)}"
-            )
-        if null_position is not None and not cudf.api.types.is_list_like(
-            null_position
-        ):
-            raise TypeError(
-                f"Expected a list-like or None for `null_position`, got "
-                f"{type(null_position)}"
-            )
-        return libcudf.sort.is_sorted(
-            [*self._columns], ascending=ascending, null_position=null_position
-        )
-
-    @_cudf_nvtx_annotate
-    def _split(self, splits):
+    @_performance_tracking
+    def _split(self, splits: list[int]) -> list[Self]:
         """Split a frame with split points in ``splits``. Returns a list of
         Frames of length `len(splits) + 1`.
         """
         return [
             self._from_columns_like_self(
-                libcudf.copying.columns_split([*self._data.columns], splits)[
-                    split_idx
-                ],
+                [ColumnBase.from_pylibcudf(col) for col in split],
                 self._column_names,
             )
-            for split_idx in range(len(splits) + 1)
+            for split in copying.columns_split(self._columns, splits)
         ]
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _encode(self):
-        columns, indices = libcudf.transform.table_encode([*self._columns])
+        plc_table, plc_column = plc.transform.encode(
+            plc.Table([col.to_pylibcudf(mode="read") for col in self._columns])
+        )
+        columns = [
+            ColumnBase.from_pylibcudf(col) for col in plc_table.columns()
+        ]
+        indices = ColumnBase.from_pylibcudf(plc_column)
         keys = self._from_columns_like_self(columns)
         return keys, indices
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _unaryop(self, op):
         data_columns = (col.unary_operator(op) for col in self._columns)
-        return self._from_data_like_self(zip(self._column_names, data_columns))
+        return self._from_data_like_self(
+            self._data._from_columns_like_self(data_columns)
+        )
 
     @classmethod
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _colwise_binop(
         cls,
-        operands: Dict[Optional[str], Tuple[ColumnBase, Any, bool, Any]],
+        operands: dict[str | None, tuple[ColumnBase, Any, bool, Any]],
         fn: str,
     ):
         """Implement binary ops between two frame-like objects.
@@ -1733,15 +1602,15 @@ class Frame(BinaryOperand, Scannable):
 
         return output
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         return _array_ufunc(self, ufunc, method, inputs, kwargs)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @acquire_spill_lock()
     def _apply_cupy_ufunc_to_operands(
         self, ufunc, cupy_func, operands, **kwargs
-    ):
+    ) -> list[dict[Any, ColumnBase]]:
         # Note: There are some operations that may be supported by libcudf but
         # are not supported by pandas APIs. In particular, libcudf binary
         # operations support logical and/or operations as well as
@@ -1752,7 +1621,7 @@ class Frame(BinaryOperand, Scannable):
         # without cupy.
 
         mask = None
-        data = [{} for _ in range(ufunc.nout)]
+        data: list[dict[Any, ColumnBase]] = [{} for _ in range(ufunc.nout)]
         for name, (left, right, _, _) in operands.items():
             cupy_inputs = []
             for inp in (left, right) if ufunc.nin == 2 else (left,):
@@ -1778,164 +1647,56 @@ class Frame(BinaryOperand, Scannable):
                 data[i][name] = as_column(out).set_mask(mask)
         return data
 
-    @_cudf_nvtx_annotate
-    def dot(self, other, reflect=False):
-        """
-        Get dot product of frame and other, (binary operator `dot`).
-
-        Among flexible wrappers (`add`, `sub`, `mul`, `div`, `mod`, `pow`,
-        `dot`) to arithmetic operators: `+`, `-`, `*`, `/`, `//`, `%`, `**`,
-        `@`.
-
-        Parameters
-        ----------
-        other : Sequence, Series, or DataFrame
-            Any multiple element data structure, or list-like object.
-        reflect : bool, default False
-            If ``True``, swap the order of the operands. See
-            https://docs.python.org/3/reference/datamodel.html#object.__ror__
-            for more information on when this is necessary.
-
-        Returns
-        -------
-        scalar, Series, or DataFrame
-            The result of the operation.
-
-        Examples
-        --------
-        >>> import cudf
-        >>> df = cudf.DataFrame([[1, 2, 3, 4],
-        ...                      [5, 6, 7, 8]])
-        >>> df @ df.T
-            0    1
-        0  30   70
-        1  70  174
-        >>> s = cudf.Series([1, 1, 1, 1])
-        >>> df @ s
-        0    10
-        1    26
-        dtype: int64
-        >>> [1, 2, 3, 4] @ s
-        10
-        """
-        # TODO: This function does not currently support nulls.
-        lhs = self.values
-        result_index = None
-        result_cols = None
-        if isinstance(self, cudf.Series) and isinstance(
-            other, (cudf.Series, cudf.DataFrame)
-        ):
-            common = self.index.union(other.index)
-            if len(common) > len(self.index) or len(common) > len(other.index):
-                raise ValueError("matrices are not aligned")
-
-            lhs = self.reindex(index=common, copy=False).values
-            rhs = other.reindex(index=common, copy=False).values
-            if isinstance(other, cudf.DataFrame):
-                result_index = other._data.to_pandas_index()
-        elif isinstance(self, cudf.DataFrame) and isinstance(
-            other, (cudf.Series, cudf.DataFrame)
-        ):
-            common = self._data.to_pandas_index().union(
-                other.index.to_pandas()
-            )
-            if len(common) > len(self._data.names) or len(common) > len(
-                other.index
-            ):
-                raise ValueError("matrices are not aligned")
-
-            lhs = self.reindex(columns=common, copy=False)
-            result_index = lhs.index
-
-            rhs = other.reindex(index=common, copy=False).values
-            lhs = lhs.values
-            if isinstance(other, cudf.DataFrame):
-                result_cols = other._data.to_pandas_index()
-
-        elif isinstance(
-            other, (cupy.ndarray, np.ndarray)
-        ) or can_convert_to_column(other):
-            rhs = cupy.asarray(other)
-        else:
-            # TODO: This should raise an exception, not return NotImplemented,
-            # but __matmul__ relies on the current behavior. We should either
-            # move this implementation to __matmul__ and call it from here
-            # (checking for NotImplemented and raising NotImplementedError if
-            # that's what's returned), or __matmul__ should catch a
-            # NotImplementedError from here and return NotImplemented. The
-            # latter feels cleaner (putting the implementation in this method
-            # rather than in the operator) but will be slower in the (highly
-            # unlikely) case that we're multiplying a cudf object with another
-            # type of object that somehow supports this behavior.
-            return NotImplemented
-        if reflect:
-            lhs, rhs = rhs, lhs
-
-        result = lhs.dot(rhs)
-        if len(result.shape) == 1:
-            return cudf.Series(
-                result,
-                index=self.index if result_index is None else result_index,
-            )
-        if len(result.shape) == 2:
-            return cudf.DataFrame(
-                result,
-                index=self.index if result_index is None else result_index,
-                columns=result_cols,
-            )
-        return result.item()
-
-    @_cudf_nvtx_annotate
-    def __matmul__(self, other):
-        return self.dot(other)
-
-    @_cudf_nvtx_annotate
-    def __rmatmul__(self, other):
-        return self.dot(other, reflect=True)
-
     # Unary logical operators
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def __neg__(self):
         """Negate for integral dtypes, logical NOT for bools."""
         return self._from_data_like_self(
-            {
-                name: col.unary_operator("not")
-                if is_bool_dtype(col.dtype)
-                else -1 * col
-                for name, col in self._data.items()
-            }
+            self._data._from_columns_like_self(
+                (
+                    col.unary_operator("not")
+                    if col.dtype.kind == "b"
+                    else col.unary_operator("negate")
+                    for col in self._columns
+                )
+            )
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def __pos__(self):
         return self.copy(deep=True)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def __abs__(self):
         return self._unaryop("abs")
 
+    def __bool__(self):
+        raise ValueError(
+            f"The truth value of a {type(self).__name__} is ambiguous. Use "
+            "a.empty, a.bool(), a.item(), a.any() or a.all()."
+        )
+
     # Reductions
     @classmethod
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _get_axis_from_axis_arg(cls, axis):
         try:
             return cls._SUPPORT_AXIS_LOOKUP[axis]
         except KeyError:
             raise ValueError(f"No axis named {axis} for object type {cls}")
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _reduce(self, *args, **kwargs):
         raise NotImplementedError(
             f"Reductions are not supported for objects of type {type(self)}."
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def min(
         self,
-        axis=no_default,
+        axis=0,
         skipna=True,
-        level=None,
-        numeric_only=None,
+        numeric_only=False,
         **kwargs,
     ):
         """
@@ -1947,46 +1708,46 @@ class Frame(BinaryOperand, Scannable):
             Axis for the function to be applied on.
         skipna: bool, default True
             Exclude NA/null values when computing the result.
-        level: int or level name, default None
-            If the axis is a MultiIndex (hierarchical), count along a
-            particular level, collapsing into a Series.
-        numeric_only: bool, default None
-            Include only float, int, boolean columns. If None, will attempt to
-            use everything, then use only numeric data.
+        numeric_only: bool, default False
+            If True, includes only float, int, boolean columns.
+            If False, will raise error in-case there are
+            non-numeric columns.
 
         Returns
         -------
         Series
 
-        Notes
-        -----
-        Parameters currently not supported are `level`, `numeric_only`.
-
         Examples
         --------
         >>> import cudf
         >>> df = cudf.DataFrame({'a': [1, 2, 3, 4], 'b': [7, 8, 9, 10]})
-        >>> df.min()
+        >>> min_series = df.min()
+        >>> min_series
         a    1
         b    7
         dtype: int64
+        >>> min_series.min()
+        1
+
+        .. pandas-compat::
+            :meth:`pandas.DataFrame.min`, :meth:`pandas.Series.min`
+
+            Parameters currently not supported are `level`, `numeric_only`.
         """
         return self._reduce(
             "min",
             axis=axis,
             skipna=skipna,
-            level=level,
             numeric_only=numeric_only,
             **kwargs,
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def max(
         self,
-        axis=no_default,
+        axis=0,
         skipna=True,
-        level=None,
-        numeric_only=None,
+        numeric_only=False,
         **kwargs,
     ):
         """
@@ -1998,20 +1759,14 @@ class Frame(BinaryOperand, Scannable):
             Axis for the function to be applied on.
         skipna: bool, default True
             Exclude NA/null values when computing the result.
-        level: int or level name, default None
-            If the axis is a MultiIndex (hierarchical), count along a
-            particular level, collapsing into a Series.
-        numeric_only: bool, default None
-            Include only float, int, boolean columns. If None, will attempt to
-            use everything, then use only numeric data.
+        numeric_only: bool, default False
+            If True, includes only float, int, boolean columns.
+            If False, will raise error in-case there are
+            non-numeric columns.
 
         Returns
         -------
         Series
-
-        Notes
-        -----
-        Parameters currently not supported are `level`, `numeric_only`.
 
         Examples
         --------
@@ -2021,427 +1776,22 @@ class Frame(BinaryOperand, Scannable):
         a     4
         b    10
         dtype: int64
+
+        .. pandas-compat::
+            :meth:`pandas.DataFrame.max`, :meth:`pandas.Series.max`
+
+            Parameters currently not supported are `level`, `numeric_only`.
         """
         return self._reduce(
             "max",
             axis=axis,
             skipna=skipna,
-            level=level,
             numeric_only=numeric_only,
             **kwargs,
         )
 
-    @_cudf_nvtx_annotate
-    def sum(
-        self,
-        axis=no_default,
-        skipna=True,
-        dtype=None,
-        level=None,
-        numeric_only=None,
-        min_count=0,
-        **kwargs,
-    ):
-        """
-        Return sum of the values in the DataFrame.
-
-        Parameters
-        ----------
-        axis: {index (0), columns(1)}
-            Axis for the function to be applied on.
-        skipna: bool, default True
-            Exclude NA/null values when computing the result.
-        dtype: data type
-            Data type to cast the result to.
-        min_count: int, default 0
-            The required number of valid values to perform the operation.
-            If fewer than min_count non-NA values are present the result
-            will be NA.
-
-            The default being 0. This means the sum of an all-NA or empty
-            Series is 0, and the product of an all-NA or empty Series is 1.
-
-        Returns
-        -------
-        Series
-
-        Notes
-        -----
-        Parameters currently not supported are `level`, `numeric_only`.
-
-        Examples
-        --------
-        >>> import cudf
-        >>> df = cudf.DataFrame({'a': [1, 2, 3, 4], 'b': [7, 8, 9, 10]})
-        >>> df.sum()
-        a    10
-        b    34
-        dtype: int64
-        """
-        return self._reduce(
-            "sum",
-            axis=axis,
-            skipna=skipna,
-            dtype=dtype,
-            level=level,
-            numeric_only=numeric_only,
-            min_count=min_count,
-            **kwargs,
-        )
-
-    @_cudf_nvtx_annotate
-    def product(
-        self,
-        axis=no_default,
-        skipna=True,
-        dtype=None,
-        level=None,
-        numeric_only=None,
-        min_count=0,
-        **kwargs,
-    ):
-        """
-        Return product of the values in the DataFrame.
-
-        Parameters
-        ----------
-        axis: {index (0), columns(1)}
-            Axis for the function to be applied on.
-        skipna: bool, default True
-            Exclude NA/null values when computing the result.
-        dtype: data type
-            Data type to cast the result to.
-        min_count: int, default 0
-            The required number of valid values to perform the operation.
-            If fewer than min_count non-NA values are present the result
-            will be NA.
-
-            The default being 0. This means the sum of an all-NA or empty
-            Series is 0, and the product of an all-NA or empty Series is 1.
-
-        Returns
-        -------
-        Series
-
-        Notes
-        -----
-        Parameters currently not supported are level`, `numeric_only`.
-
-        Examples
-        --------
-        >>> import cudf
-        >>> df = cudf.DataFrame({'a': [1, 2, 3, 4], 'b': [7, 8, 9, 10]})
-        >>> df.product()
-        a      24
-        b    5040
-        dtype: int64
-        """
-
-        return self._reduce(
-            # cuDF columns use "product" as the op name, but cupy uses "prod"
-            # and we need cupy if axis == 1.
-            "prod" if axis in {1, "columns"} else "product",
-            axis=axis,
-            skipna=skipna,
-            dtype=dtype,
-            level=level,
-            numeric_only=numeric_only,
-            min_count=min_count,
-            **kwargs,
-        )
-
-    # Alias for pandas compatibility.
-    prod = product
-
-    @_cudf_nvtx_annotate
-    def mean(
-        self,
-        axis=no_default,
-        skipna=True,
-        level=None,
-        numeric_only=None,
-        **kwargs,
-    ):
-        """
-        Return the mean of the values for the requested axis.
-
-        Parameters
-        ----------
-        axis : {0 or 'index', 1 or 'columns'}
-            Axis for the function to be applied on.
-        skipna : bool, default True
-            Exclude NA/null values when computing the result.
-        level : int or level name, default None
-            If the axis is a MultiIndex (hierarchical), count along a
-            particular level, collapsing into a Series.
-        numeric_only : bool, default None
-            Include only float, int, boolean columns. If None, will attempt to
-            use everything, then use only numeric data. Not implemented for
-            Series.
-        **kwargs
-            Additional keyword arguments to be passed to the function.
-
-        Returns
-        -------
-        mean : Series or DataFrame (if level specified)
-
-        Examples
-        --------
-        >>> import cudf
-        >>> df = cudf.DataFrame({'a': [1, 2, 3, 4], 'b': [7, 8, 9, 10]})
-        >>> df.mean()
-        a    2.5
-        b    8.5
-        dtype: float64
-        """
-        return self._reduce(
-            "mean",
-            axis=axis,
-            skipna=skipna,
-            level=level,
-            numeric_only=numeric_only,
-            **kwargs,
-        )
-
-    @_cudf_nvtx_annotate
-    def std(
-        self,
-        axis=no_default,
-        skipna=True,
-        level=None,
-        ddof=1,
-        numeric_only=None,
-        **kwargs,
-    ):
-        """
-        Return sample standard deviation of the DataFrame.
-
-        Normalized by N-1 by default. This can be changed using
-        the `ddof` argument
-
-        Parameters
-        ----------
-        axis: {index (0), columns(1)}
-            Axis for the function to be applied on.
-        skipna: bool, default True
-            Exclude NA/null values. If an entire row/column is NA, the result
-            will be NA.
-        ddof: int, default 1
-            Delta Degrees of Freedom. The divisor used in calculations
-            is N - ddof, where N represents the number of elements.
-
-        Returns
-        -------
-        Series
-
-        Notes
-        -----
-        Parameters currently not supported are `level` and
-        `numeric_only`
-
-        Examples
-        --------
-        >>> import cudf
-        >>> df = cudf.DataFrame({'a': [1, 2, 3, 4], 'b': [7, 8, 9, 10]})
-        >>> df.std()
-        a    1.290994
-        b    1.290994
-        dtype: float64
-        """
-
-        return self._reduce(
-            "std",
-            axis=axis,
-            skipna=skipna,
-            level=level,
-            ddof=ddof,
-            numeric_only=numeric_only,
-            **kwargs,
-        )
-
-    @_cudf_nvtx_annotate
-    def var(
-        self,
-        axis=no_default,
-        skipna=True,
-        level=None,
-        ddof=1,
-        numeric_only=None,
-        **kwargs,
-    ):
-        """
-        Return unbiased variance of the DataFrame.
-
-        Normalized by N-1 by default. This can be changed using the
-        ddof argument.
-
-        Parameters
-        ----------
-        axis: {index (0), columns(1)}
-            Axis for the function to be applied on.
-        skipna: bool, default True
-            Exclude NA/null values. If an entire row/column is NA, the result
-            will be NA.
-        ddof: int, default 1
-            Delta Degrees of Freedom. The divisor used in calculations is
-            N - ddof, where N represents the number of elements.
-
-        Returns
-        -------
-        scalar
-
-        Notes
-        -----
-        Parameters currently not supported are `level` and
-        `numeric_only`
-
-        Examples
-        --------
-        >>> import cudf
-        >>> df = cudf.DataFrame({'a': [1, 2, 3, 4], 'b': [7, 8, 9, 10]})
-        >>> df.var()
-        a    1.666667
-        b    1.666667
-        dtype: float64
-        """
-        return self._reduce(
-            "var",
-            axis=axis,
-            skipna=skipna,
-            level=level,
-            ddof=ddof,
-            numeric_only=numeric_only,
-            **kwargs,
-        )
-
-    @_cudf_nvtx_annotate
-    def kurtosis(
-        self,
-        axis=no_default,
-        skipna=True,
-        level=None,
-        numeric_only=None,
-        **kwargs,
-    ):
-        """
-        Return Fisher's unbiased kurtosis of a sample.
-
-        Kurtosis obtained using Fisher's definition of
-        kurtosis (kurtosis of normal == 0.0). Normalized by N-1.
-
-        Parameters
-        ----------
-        axis: {index (0), columns(1)}
-            Axis for the function to be applied on.
-        skipna: bool, default True
-            Exclude NA/null values when computing the result.
-
-        Returns
-        -------
-        Series or scalar
-
-        Notes
-        -----
-        Parameters currently not supported are `level` and `numeric_only`
-
-        Examples
-        --------
-        **Series**
-
-        >>> import cudf
-        >>> series = cudf.Series([1, 2, 3, 4])
-        >>> series.kurtosis()
-        -1.1999999999999904
-
-        **DataFrame**
-
-        >>> import cudf
-        >>> df = cudf.DataFrame({'a': [1, 2, 3, 4], 'b': [7, 8, 9, 10]})
-        >>> df.kurt()
-        a   -1.2
-        b   -1.2
-        dtype: float64
-        """
-        if axis not in (0, "index", None, no_default):
-            raise NotImplementedError("Only axis=0 is currently supported.")
-
-        return self._reduce(
-            "kurtosis",
-            axis=axis,
-            skipna=skipna,
-            level=level,
-            numeric_only=numeric_only,
-            **kwargs,
-        )
-
-    # Alias for kurtosis.
-    kurt = kurtosis
-
-    @_cudf_nvtx_annotate
-    def skew(
-        self,
-        axis=no_default,
-        skipna=True,
-        level=None,
-        numeric_only=None,
-        **kwargs,
-    ):
-        """
-        Return unbiased Fisher-Pearson skew of a sample.
-
-        Parameters
-        ----------
-        skipna: bool, default True
-            Exclude NA/null values when computing the result.
-
-        Returns
-        -------
-        Series
-
-        Notes
-        -----
-        Parameters currently not supported are `axis`, `level` and
-        `numeric_only`
-
-        Examples
-        --------
-        **Series**
-
-        >>> import cudf
-        >>> series = cudf.Series([1, 2, 3, 4, 5, 6, 6])
-        >>> series
-        0    1
-        1    2
-        2    3
-        3    4
-        4    5
-        5    6
-        6    6
-        dtype: int64
-
-        **DataFrame**
-
-        >>> import cudf
-        >>> df = cudf.DataFrame({'a': [3, 2, 3, 4], 'b': [7, 8, 10, 10]})
-        >>> df.skew()
-        a    0.00000
-        b   -0.37037
-        dtype: float64
-        """
-        if axis not in (0, "index", None, no_default):
-            raise NotImplementedError("Only axis=0 is currently supported.")
-
-        return self._reduce(
-            "skew",
-            axis=axis,
-            skipna=skipna,
-            level=level,
-            numeric_only=numeric_only,
-            **kwargs,
-        )
-
-    @_cudf_nvtx_annotate
-    def all(self, axis=0, skipna=True, level=None, **kwargs):
+    @_performance_tracking
+    def all(self, axis=0, skipna=True, **kwargs):
         """
         Return whether all elements are True in DataFrame.
 
@@ -2469,7 +1819,7 @@ class Frame(BinaryOperand, Scannable):
 
         Notes
         -----
-        Parameters currently not supported are `bool_only`, `level`.
+        Parameters currently not supported are `bool_only`.
 
         Examples
         --------
@@ -2479,17 +1829,22 @@ class Frame(BinaryOperand, Scannable):
         a     True
         b    False
         dtype: bool
+
+        .. pandas-compat::
+            :meth:`pandas.DataFrame.all`, :meth:`pandas.Series.all`
+
+            Parameters currently not supported are `axis`, `bool_only`,
+            `level`.
         """
         return self._reduce(
             "all",
             axis=axis,
             skipna=skipna,
-            level=level,
             **kwargs,
         )
 
-    @_cudf_nvtx_annotate
-    def any(self, axis=0, skipna=True, level=None, **kwargs):
+    @_performance_tracking
+    def any(self, axis=0, skipna=True, **kwargs):
         """
         Return whether any elements is True in DataFrame.
 
@@ -2517,7 +1872,7 @@ class Frame(BinaryOperand, Scannable):
 
         Notes
         -----
-        Parameters currently not supported are `bool_only`, `level`.
+        Parameters currently not supported are `bool_only`.
 
         Examples
         --------
@@ -2527,306 +1882,47 @@ class Frame(BinaryOperand, Scannable):
         a    True
         b    True
         dtype: bool
+
+        .. pandas-compat::
+            :meth:`pandas.DataFrame.any`, :meth:`pandas.Series.any`
+
+            Parameters currently not supported are `axis`, `bool_only`,
+            `level`.
         """
         return self._reduce(
             "any",
             axis=axis,
             skipna=skipna,
-            level=level,
             **kwargs,
         )
 
-    @_cudf_nvtx_annotate
-    def median(
-        self, axis=None, skipna=True, level=None, numeric_only=None, **kwargs
-    ):
-        """
-        Return the median of the values for the requested axis.
-
-        Parameters
-        ----------
-        skipna : bool, default True
-            Exclude NA/null values when computing the result.
-
-        Returns
-        -------
-        scalar
-
-        Notes
-        -----
-        Parameters currently not supported are `level` and `numeric_only`.
-
-        Examples
-        --------
-        >>> import cudf
-        >>> ser = cudf.Series([10, 25, 3, 25, 24, 6])
-        >>> ser
-        0    10
-        1    25
-        2     3
-        3    25
-        4    24
-        5     6
-        dtype: int64
-        >>> ser.median()
-        17.0
-        """
-        return self._reduce(
-            "median",
-            axis=axis,
-            skipna=skipna,
-            level=level,
-            numeric_only=numeric_only,
-            **kwargs,
-        )
-
-    @_cudf_nvtx_annotate
-    @ioutils.doc_to_json()
-    def to_json(self, path_or_buf=None, *args, **kwargs):
-        """{docstring}"""
-
-        return cudf.io.json.to_json(
-            self, path_or_buf=path_or_buf, *args, **kwargs
-        )
-
-    @_cudf_nvtx_annotate
-    @ioutils.doc_to_hdf()
-    def to_hdf(self, path_or_buf, key, *args, **kwargs):
-        """{docstring}"""
-
-        cudf.io.hdf.to_hdf(path_or_buf, key, self, *args, **kwargs)
-
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @ioutils.doc_to_dlpack()
     def to_dlpack(self):
         """{docstring}"""
 
         return cudf.io.dlpack.to_dlpack(self)
 
-    @_cudf_nvtx_annotate
-    def to_string(self):
-        r"""
-        Convert to string
-
-        cuDF uses Pandas internals for efficient string formatting.
-        Set formatting options using pandas string formatting options and
-        cuDF objects will print identically to Pandas objects.
-
-        cuDF supports `null/None` as a value in any column type, which
-        is transparently supported during this output process.
-
-        Examples
-        --------
-        >>> import cudf
-        >>> df = cudf.DataFrame()
-        >>> df['key'] = [0, 1, 2]
-        >>> df['val'] = [float(i + 10) for i in range(3)]
-        >>> df.to_string()
-        '   key   val\n0    0  10.0\n1    1  11.0\n2    2  12.0'
-        """
+    @_performance_tracking
+    def __str__(self):
         return repr(self)
 
-    @_cudf_nvtx_annotate
-    def __str__(self):
-        return self.to_string()
-
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def __deepcopy__(self, memo):
         return self.copy(deep=True)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def __copy__(self):
         return self.copy(deep=False)
 
-    @_cudf_nvtx_annotate
-    def head(self, n=5):
-        """
-        Return the first `n` rows.
-        This function returns the first `n` rows for the object based
-        on position. It is useful for quickly testing if your object
-        has the right type of data in it.
-        For negative values of `n`, this function returns all rows except
-        the last `n` rows, equivalent to ``df[:-n]``.
-
-        Parameters
-        ----------
-        n : int, default 5
-            Number of rows to select.
-
-        Returns
-        -------
-        DataFrame or Series
-            The first `n` rows of the caller object.
-
-        Examples
-        --------
-        **Series**
-
-        >>> ser = cudf.Series(['alligator', 'bee', 'falcon',
-        ... 'lion', 'monkey', 'parrot', 'shark', 'whale', 'zebra'])
-        >>> ser
-        0    alligator
-        1          bee
-        2       falcon
-        3         lion
-        4       monkey
-        5       parrot
-        6        shark
-        7        whale
-        8        zebra
-        dtype: object
-
-        Viewing the first 5 lines
-
-        >>> ser.head()
-        0    alligator
-        1          bee
-        2       falcon
-        3         lion
-        4       monkey
-        dtype: object
-
-        Viewing the first `n` lines (three in this case)
-
-        >>> ser.head(3)
-        0    alligator
-        1          bee
-        2       falcon
-        dtype: object
-
-        For negative values of `n`
-
-        >>> ser.head(-3)
-        0    alligator
-        1          bee
-        2       falcon
-        3         lion
-        4       monkey
-        5       parrot
-        dtype: object
-
-        **DataFrame**
-
-        >>> df = cudf.DataFrame()
-        >>> df['key'] = [0, 1, 2, 3, 4]
-        >>> df['val'] = [float(i + 10) for i in range(5)]  # insert column
-        >>> df.head(2)
-           key   val
-        0    0  10.0
-        1    1  11.0
-        """
-        return self.iloc[:n]
-
-    @_cudf_nvtx_annotate
-    def tail(self, n=5):
-        """
-        Returns the last n rows as a new DataFrame or Series
-
-        Examples
-        --------
-        **DataFrame**
-
-        >>> import cudf
-        >>> df = cudf.DataFrame()
-        >>> df['key'] = [0, 1, 2, 3, 4]
-        >>> df['val'] = [float(i + 10) for i in range(5)]  # insert column
-        >>> df.tail(2)
-           key   val
-        3    3  13.0
-        4    4  14.0
-
-        **Series**
-
-        >>> import cudf
-        >>> ser = cudf.Series([4, 3, 2, 1, 0])
-        >>> ser.tail(2)
-        3    1
-        4    0
-        """
-        if n == 0:
-            return self.iloc[0:0]
-
-        return self.iloc[-n:]
-
-    @_cudf_nvtx_annotate
-    @copy_docstring(Rolling)
-    def rolling(
-        self, window, min_periods=None, center=False, axis=0, win_type=None
-    ):
-        return Rolling(
-            self,
-            window,
-            min_periods=min_periods,
-            center=center,
-            axis=axis,
-            win_type=win_type,
-        )
-
-    @_cudf_nvtx_annotate
-    def nans_to_nulls(self):
-        """
-        Convert nans (if any) to nulls
-
-        Returns
-        -------
-        DataFrame or Series
-
-        Examples
-        --------
-        **Series**
-
-        >>> import cudf, numpy as np
-        >>> series = cudf.Series([1, 2, np.nan, None, 10], nan_as_null=False)
-        >>> series
-        0     1.0
-        1     2.0
-        2     NaN
-        3    <NA>
-        4    10.0
-        dtype: float64
-        >>> series.nans_to_nulls()
-        0     1.0
-        1     2.0
-        2    <NA>
-        3    <NA>
-        4    10.0
-        dtype: float64
-
-        **DataFrame**
-
-        >>> df = cudf.DataFrame()
-        >>> df['a'] = cudf.Series([1, None, np.nan], nan_as_null=False)
-        >>> df['b'] = cudf.Series([None, 3.14, np.nan], nan_as_null=False)
-        >>> df
-              a     b
-        0   1.0  <NA>
-        1  <NA>  3.14
-        2   NaN   NaN
-        >>> df.nans_to_nulls()
-              a     b
-        0   1.0  <NA>
-        1  <NA>  3.14
-        2  <NA>  <NA>
-        """
-        result_data = {}
-        for name, col in self._data.items():
-            try:
-                result_data[name] = col.nans_to_nulls()
-            except AttributeError:
-                result_data[name] = col.copy()
-        return self._from_data_like_self(result_data)
-
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def __invert__(self):
         """Bitwise invert (~) for integral dtypes, logical NOT for bools."""
         return self._from_data_like_self(
-            {
-                name: _apply_inverse_column(col)
-                for name, col in self._data.items()
-            }
+            self._data._from_columns_like_self((~col for col in self._columns))
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def nunique(self, dropna: bool = True):
         """
         Returns a per column mapping with counts of unique values for
@@ -2842,16 +1938,15 @@ class Frame(BinaryOperand, Scannable):
         dict
             Name and unique value counts of each column in frame.
         """
-        return {
-            name: col.distinct_count(dropna=dropna)
-            for name, col in self._data.items()
-        }
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement nunique"
+        )
 
     @staticmethod
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _repeat(
-        columns: List[ColumnBase], repeats, axis=None
-    ) -> List[ColumnBase]:
+        columns: list[ColumnBase], repeats, axis=None
+    ) -> list[ColumnBase]:
         if axis is not None:
             raise NotImplementedError(
                 "Only axis=`None` supported at this time."
@@ -2860,25 +1955,24 @@ class Frame(BinaryOperand, Scannable):
         if not is_scalar(repeats):
             repeats = as_column(repeats)
 
-        return libcudf.filling.repeat(columns, repeats)
+        with acquire_spill_lock():
+            plc_table = plc.Table(
+                [col.to_pylibcudf(mode="read") for col in columns]
+            )
+            if isinstance(repeats, ColumnBase):
+                repeats = repeats.to_pylibcudf(mode="read")
+            return [
+                ColumnBase.from_pylibcudf(col)
+                for col in plc.filling.repeat(plc_table, repeats).columns()
+            ]
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @_warn_no_dask_cudf
     def __dask_tokenize__(self):
+        from dask.base import normalize_token
+
         return [
             type(self),
-            self._dtypes,
-            self.to_pandas(),
+            str(dict(self._dtypes)),
+            normalize_token(self.to_pandas()),
         ]
-
-
-def _apply_inverse_column(col: ColumnBase) -> ColumnBase:
-    """Bitwise invert (~) for integral dtypes, logical NOT for bools."""
-    if np.issubdtype(col.dtype, np.integer):
-        return col.unary_operator("invert")
-    elif is_bool_dtype(col.dtype):
-        return col.unary_operator("not")
-    else:
-        raise TypeError(
-            f"Operation `~` not supported on {col.dtype.type.__name__}"
-        )

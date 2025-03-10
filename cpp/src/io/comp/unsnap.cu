@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,19 +15,16 @@
  */
 
 #include "gpuinflate.hpp"
-
-#include <io/utilities/block_utils.cuh>
+#include "io/utilities/block_utils.cuh"
 
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cub/cub.cuh>
 
-namespace cudf {
-namespace io {
+namespace cudf::io::detail {
 constexpr int32_t batch_size    = (1 << 5);
 constexpr int32_t batch_count   = (1 << 2);
 constexpr int32_t prefetch_size = (1 << 9);  // 512B, in 32B chunks
-constexpr bool log_cyclecount   = false;
 
 void __device__ busy_wait(size_t cycles)
 {
@@ -66,7 +63,8 @@ struct unsnap_queue_s {
  * @brief snappy decompression state
  */
 struct unsnap_state_s {
-  constexpr unsnap_state_s() noexcept {}  // required to compile on ctk-12.2 + aarch64
+  CUDF_HOST_DEVICE constexpr unsnap_state_s() noexcept {
+  }  // required to compile on ctk-12.2 + aarch64
 
   uint8_t const* base{};           ///< base ptr of compressed stream
   uint8_t const* end{};            ///< end of compressed stream
@@ -628,7 +626,7 @@ __device__ void snappy_process_symbols(unsnap_state_s* s, int t, Storage& temp_s
  * @param[out] outputs Decompression status per block
  */
 template <int block_size>
-__global__ void __launch_bounds__(block_size)
+CUDF_KERNEL void __launch_bounds__(block_size)
   unsnap_kernel(device_span<device_span<uint8_t const> const> inputs,
                 device_span<device_span<uint8_t> const> outputs,
                 device_span<compression_result> results)
@@ -647,7 +645,6 @@ __global__ void __launch_bounds__(block_size)
     auto cur       = s->src.begin();
     auto const end = s->src.end();
     s->error       = 0;
-    if (log_cyclecount) { s->tstart = clock(); }
     if (cur < end) {
       // Read uncompressed size (varint), limited to 32-bit
       uint32_t uncompressed_size = *cur++;
@@ -705,11 +702,6 @@ __global__ void __launch_bounds__(block_size)
     results[strm_id].bytes_written = s->uncompressed_size - s->bytes_left;
     results[strm_id].status =
       (s->error == 0) ? compression_status::SUCCESS : compression_status::FAILURE;
-    if (log_cyclecount) {
-      results[strm_id].reserved = clock() - s->tstart;
-    } else {
-      results[strm_id].reserved = 0;
-    }
   }
 }
 
@@ -724,5 +716,4 @@ void gpu_unsnap(device_span<device_span<uint8_t const> const> inputs,
   unsnap_kernel<128><<<dim_grid, dim_block, 0, stream.value()>>>(inputs, outputs, results);
 }
 
-}  // namespace io
-}  // namespace cudf
+}  // namespace cudf::io::detail

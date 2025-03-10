@@ -1,51 +1,47 @@
-# Copyright (c) 2021-2023, NVIDIA CORPORATION.
+# Copyright (c) 2021-2025, NVIDIA CORPORATION.
 
 from __future__ import annotations
 
-import builtins
-import pickle
 import warnings
 from functools import cached_property
-from typing import Any, Set, Tuple
+from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
 import pandas as pd
 from typing_extensions import Self
 
 import cudf
-from cudf._lib.copying import _gather_map_is_valid, gather
-from cudf._lib.stream_compaction import (
-    apply_boolean_mask,
-    drop_duplicates,
-    drop_nulls,
-)
-from cudf._lib.types import size_type_dtype
 from cudf.api.extensions import no_default
-from cudf.api.types import (
-    is_bool_dtype,
-    is_integer,
-    is_integer_dtype,
-    is_list_like,
-    is_scalar,
-    is_signed_integer_dtype,
-    is_unsigned_integer_dtype,
-)
+from cudf.api.types import is_integer, is_list_like, is_scalar
+from cudf.core._internals import copying, stream_compaction
 from cudf.core.abc import Serializable
 from cudf.core.column import ColumnBase, column
-from cudf.core.column_accessor import ColumnAccessor
+from cudf.core.copy_types import GatherMap
 from cudf.errors import MixedTypeError
 from cudf.utils import ioutils
-from cudf.utils.dtypes import can_convert_to_column, is_mixed_with_object_dtype
+from cudf.utils.dtypes import (
+    SIZE_TYPE_DTYPE,
+    can_convert_to_column,
+    is_mixed_with_object_dtype,
+)
 from cudf.utils.utils import _is_same_name
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    import cupy
+
+    from cudf.core.column_accessor import ColumnAccessor
 
 
 class BaseIndex(Serializable):
     """Base class for all cudf Index types."""
 
-    _accessors: Set[Any] = set()
+    _accessors: set[Any] = set()
     _data: ColumnAccessor
 
     @property
-    def _columns(self) -> Tuple[Any, ...]:
+    def _columns(self) -> tuple[Any, ...]:
         raise NotImplementedError
 
     @cached_property
@@ -57,6 +53,12 @@ class BaseIndex(Serializable):
 
     def __len__(self):
         raise NotImplementedError
+
+    def __bool__(self):
+        raise ValueError(
+            f"The truth value of a {type(self).__name__} is ambiguous. Use "
+            "a.empty, a.bool(), a.item(), a.any() or a.all()."
+        )
 
     @property
     def size(self):
@@ -89,13 +91,13 @@ class BaseIndex(Serializable):
         >>> import cudf
         >>> index = cudf.Index([1, 2, 3])
         >>> index
-        Int64Index([1, 2, 3], dtype='int64')
+        Index([1, 2, 3], dtype='int64')
         >>> index.astype('float64')
-        Float64Index([1.0, 2.0, 3.0], dtype='float64')
+        Index([1.0, 2.0, 3.0], dtype='float64')
         """
         raise NotImplementedError
 
-    def argsort(self, *args, **kwargs):
+    def argsort(self, *args, **kwargs) -> cupy.ndarray:
         """Return the integer indices that would sort the index.
 
         Parameters vary by subclass.
@@ -130,7 +132,7 @@ class BaseIndex(Serializable):
         """
         raise NotImplementedError
 
-    def tolist(self):  # noqa: D102
+    def tolist(self):
         raise TypeError(
             "cuDF does not support conversion to host memory "
             "via the `tolist()` method. Consider using "
@@ -145,11 +147,11 @@ class BaseIndex(Serializable):
         raise NotImplementedError
 
     @property  # type: ignore
-    def ndim(self):  # noqa: D401
+    def ndim(self) -> int:
         """Number of dimensions of the underlying data, by definition 1."""
         return 1
 
-    def equals(self, other):
+    def equals(self, other) -> bool:
         """
         Determine if two Index objects contain the same elements.
 
@@ -179,6 +181,91 @@ class BaseIndex(Serializable):
     def values(self):
         raise NotImplementedError
 
+    def get_indexer(self, target, method=None, limit=None, tolerance=None):
+        """
+        Compute indexer and mask for new index given the current index.
+
+        The indexer should be then used as an input to ndarray.take to align
+        the current data to the new index.
+
+        Parameters
+        ----------
+        target : Index
+        method : {None, 'pad'/'fill', 'backfill'/'bfill', 'nearest'}, optional
+            - default: exact matches only.
+            - pad / ffill: find the PREVIOUS index value if no exact match.
+            - backfill / bfill: use NEXT index value if no exact match.
+            - nearest: use the NEAREST index value if no exact match. Tied
+              distances are broken by preferring the larger index
+              value.
+        tolerance : int or float, optional
+            Maximum distance from index value for inexact matches. The value
+            of the index at the matching location must satisfy the equation
+            ``abs(index[loc] - target) <= tolerance``.
+
+        Returns
+        -------
+        cupy.ndarray
+            Integers from 0 to n - 1 indicating that the index at these
+            positions matches the corresponding target values.
+            Missing values in the target are marked by -1.
+
+        Examples
+        --------
+        >>> import cudf
+        >>> index = cudf.Index(['c', 'a', 'b'])
+        >>> index
+        Index(['c', 'a', 'b'], dtype='object')
+        >>> index.get_indexer(['a', 'b', 'x'])
+        array([ 1,  2, -1], dtype=int32)
+        """
+        raise NotImplementedError
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+
+        Parameters
+        ----------
+        key : label
+
+        Returns
+        -------
+        int or slice or boolean mask
+            - If result is unique, return integer index
+            - If index is monotonic, loc is returned as a slice object
+            - Otherwise, a boolean mask is returned
+
+        Examples
+        --------
+        >>> import cudf
+        >>> unique_index = cudf.Index(list('abc'))
+        >>> unique_index.get_loc('b')
+        1
+        >>> monotonic_index = cudf.Index(list('abbc'))
+        >>> monotonic_index.get_loc('b')
+        slice(1, 3, None)
+        >>> non_monotonic_index = cudf.Index(list('abcb'))
+        >>> non_monotonic_index.get_loc('b')
+        array([False,  True, False,  True])
+        >>> numeric_unique_index = cudf.Index([1, 2, 3])
+        >>> numeric_unique_index.get_loc(3)
+        2
+
+        **MultiIndex**
+
+        >>> multi_index = cudf.MultiIndex.from_tuples([('a', 'd'), ('b', 'e'), ('b', 'f')])
+        >>> multi_index
+        MultiIndex([('a', 'd'),
+                    ('b', 'e'),
+                    ('b', 'f')],
+                )
+        >>> multi_index.get_loc('b')
+        slice(1, 3, None)
+        >>> multi_index.get_loc(('b', 'e'))
+        1
+        """
+
     def max(self):
         """The maximum value of the index."""
         raise NotImplementedError
@@ -187,18 +274,14 @@ class BaseIndex(Serializable):
         """The minimum value of the index."""
         raise NotImplementedError
 
-    def get_loc(self, key, method=None, tolerance=None):
-        raise NotImplementedError
-
     def __getitem__(self, key):
         raise NotImplementedError()
 
     def __contains__(self, item):
+        hash(item)
         return item in self._values
 
-    def _copy_type_metadata(
-        self, other: Self, *, override_dtypes=None
-    ) -> Self:
+    def _copy_type_metadata(self: Self, other: Self) -> Self:
         raise NotImplementedError
 
     def get_level_values(self, level):
@@ -232,7 +315,7 @@ class BaseIndex(Serializable):
         >>> import cudf
         >>> idx = cudf.Index(["a", "b", "c"])
         >>> idx.get_level_values(0)
-        StringIndex(['a' 'b' 'c'], dtype='object')
+        Index(['a', 'b', 'c'], dtype='object')
         """
 
         if level == self.name:
@@ -240,25 +323,18 @@ class BaseIndex(Serializable):
         elif is_integer(level):
             if level != 0:
                 raise IndexError(
-                    f"Cannot get level: {level} " f"for index with 1 level"
+                    f"Cannot get level: {level} for index with 1 level"
                 )
             return self
         else:
-            raise KeyError(f"Requested level with name {level} " "not found")
-
-    @classmethod
-    def deserialize(cls, header, frames):
-        # Dispatch deserialization to the appropriate index type in case
-        # deserialization is ever attempted with the base class directly.
-        idx_type = pickle.loads(header["type-serialized"])
-        return idx_type.deserialize(header, frames)
+            raise KeyError(f"Requested level with name {level} not found")
 
     @property
     def names(self):
         """
-        Returns a tuple containing the name of the Index.
+        Returns a FrozenList containing the name of the Index.
         """
-        return (self.name,)
+        return pd.core.indexes.frozen.FrozenList([self.name])
 
     @names.setter
     def names(self, values):
@@ -273,36 +349,17 @@ class BaseIndex(Serializable):
 
         self.name = values[0]
 
-    def _clean_nulls_from_index(self):
+    def _pandas_repr_compatible(self):
         """
         Convert all na values(if any) in Index object
         to `<NA>` as a preprocessing step to `__repr__` methods.
 
         This will involve changing type of Index object
-        to StringIndex but it is the responsibility of the `__repr__`
+        to string dtype but it is the responsibility of the `__repr__`
         methods using this method to replace or handle representation
         of the actual types correctly.
         """
         raise NotImplementedError
-
-    @property
-    def is_monotonic(self):
-        """Return boolean if values in the object are monotonic_increasing.
-
-        This property is an alias for :attr:`is_monotonic_increasing`.
-
-        Returns
-        -------
-        bool
-        """
-        # Do not remove until pandas 2.0 support is added.
-        warnings.warn(
-            "is_monotonic is deprecated and will be removed in a future "
-            "version. Use is_monotonic_increasing instead.",
-            FutureWarning,
-        )
-
-        return self.is_monotonic_increasing
 
     @property
     def is_monotonic_increasing(self):
@@ -341,7 +398,7 @@ class BaseIndex(Serializable):
         >>> import numpy as np
         >>> index = cudf.Index([1, 2, np.nan, 3, 4], nan_as_null=False)
         >>> index
-        Float64Index([1.0, 2.0, nan, 3.0, 4.0], dtype='float64')
+        Index([1.0, 2.0, nan, 3.0, 4.0], dtype='float64')
         >>> index.hasnans
         True
 
@@ -349,14 +406,14 @@ class BaseIndex(Serializable):
 
         >>> index = cudf.Index([1, 2, None, 3, 4])
         >>> index
-        Int64Index([1, 2, <NA>, 3, 4], dtype='int64')
+        Index([1, 2, <NA>, 3, 4], dtype='int64')
         >>> index.hasnans
         True
         """
         raise NotImplementedError
 
     @property
-    def nlevels(self):
+    def nlevels(self) -> int:
         """
         Number of levels.
         """
@@ -402,9 +459,9 @@ class BaseIndex(Serializable):
         >>> import cudf
         >>> idx = cudf.Index([1, 2, 3, 4])
         >>> idx
-        Int64Index([1, 2, 3, 4], dtype='int64')
+        Index([1, 2, 3, 4], dtype='int64')
         >>> idx.set_names('quarter')
-        Int64Index([1, 2, 3, 4], dtype='int64', name='quarter')
+        Index([1, 2, 3, 4], dtype='int64', name='quarter')
         >>> idx = cudf.MultiIndex.from_product([['python', 'cobra'],
         ... [2018, 2019]])
         >>> idx
@@ -455,7 +512,7 @@ class BaseIndex(Serializable):
         """
         raise NotImplementedError
 
-    def factorize(self, sort=False, na_sentinel=None, use_na_sentinel=None):
+    def factorize(self, sort: bool = False, use_na_sentinel: bool = True):
         raise NotImplementedError
 
     def union(self, other, sort=None):
@@ -474,6 +531,7 @@ class BaseIndex(Serializable):
               2. `self` or `other` has length 0.
 
             * False : do not sort the result.
+            * True : Sort the result (which may raise TypeError).
 
         Returns
         -------
@@ -487,7 +545,7 @@ class BaseIndex(Serializable):
         >>> idx1 = cudf.Index([1, 2, 3, 4])
         >>> idx2 = cudf.Index([3, 4, 5, 6])
         >>> idx1.union(idx2)
-        Int64Index([1, 2, 3, 4, 5, 6], dtype='int64')
+        Index([1, 2, 3, 4, 5, 6], dtype='int64')
 
         MultiIndex case
 
@@ -535,27 +593,21 @@ class BaseIndex(Serializable):
         if not isinstance(other, BaseIndex):
             other = cudf.Index(other, name=self.name)
 
-        if sort not in {None, False}:
+        if sort not in {None, False, True}:
             raise ValueError(
                 f"The 'sort' keyword only takes the values of "
-                f"None or False; {sort} was passed."
+                f"[None, False, True]; {sort} was passed."
             )
 
         if cudf.get_option("mode.pandas_compatible"):
-            if (
-                is_bool_dtype(self.dtype) and not is_bool_dtype(other.dtype)
-            ) or (
-                not is_bool_dtype(self.dtype) and is_bool_dtype(other.dtype)
+            if (self.dtype.kind == "b" and other.dtype.kind != "b") or (
+                self.dtype.kind != "b" and other.dtype.kind == "b"
             ):
                 # Bools + other types will result in mixed type.
                 # This is not yet consistent in pandas and specific to APIs.
                 raise MixedTypeError("Cannot perform union with mixed types")
-            if (
-                is_signed_integer_dtype(self.dtype)
-                and is_unsigned_integer_dtype(other.dtype)
-            ) or (
-                is_unsigned_integer_dtype(self.dtype)
-                and is_signed_integer_dtype(other.dtype)
+            if (self.dtype.kind == "i" and other.dtype.kind == "u") or (
+                self.dtype.kind == "u" and other.dtype.kind == "i"
             ):
                 # signed + unsigned types will result in
                 # mixed type for union in pandas.
@@ -565,12 +617,18 @@ class BaseIndex(Serializable):
             common_dtype = cudf.utils.dtypes.find_common_type(
                 [self.dtype, other.dtype]
             )
-            return self._get_reconciled_name_object(other).astype(common_dtype)
+            res = self._get_reconciled_name_object(other).astype(common_dtype)
+            if sort:
+                return res.sort_values()
+            return res
         elif not len(self):
             common_dtype = cudf.utils.dtypes.find_common_type(
                 [self.dtype, other.dtype]
             )
-            return other._get_reconciled_name_object(self).astype(common_dtype)
+            res = other._get_reconciled_name_object(self).astype(common_dtype)
+            if sort:
+                return res.sort_values()
+            return res
 
         result = self._union(other, sort=sort)
         result.name = _get_result_name(self.name, other.name)
@@ -591,6 +649,7 @@ class BaseIndex(Serializable):
             * False : do not sort the result.
             * None : sort the result, except when `self` and `other` are equal
               or when the values cannot be compared.
+            * True : Sort the result (which may raise TypeError).
 
         Returns
         -------
@@ -603,7 +662,7 @@ class BaseIndex(Serializable):
         >>> idx1 = cudf.Index([1, 2, 3, 4])
         >>> idx2 = cudf.Index([3, 4, 5, 6])
         >>> idx1.intersection(idx2)
-        Int64Index([3, 4], dtype='int64')
+        Index([3, 4], dtype='int64')
 
         MultiIndex case
 
@@ -647,10 +706,10 @@ class BaseIndex(Serializable):
                 name=getattr(other, "name", self.name),
             )
 
-        if sort not in {None, False}:
+        if sort not in {None, False, True}:
             raise ValueError(
                 f"The 'sort' keyword only takes the values of "
-                f"None or False; {sort} was passed."
+                f"[None, False, True]; {sort} was passed."
             )
 
         if not len(self) or not len(other) or self.equals(other):
@@ -720,9 +779,9 @@ class BaseIndex(Serializable):
         >>> import cudf
         >>> index = cudf.Index([1, 2, None, 4])
         >>> index
-        Int64Index([1, 2, <NA>, 4], dtype='int64')
+        Index([1, 2, <NA>, 4], dtype='int64')
         >>> index.fillna(3)
-        Int64Index([1, 2, 3, 4], dtype='int64')
+        Index([1, 2, 3, 4], dtype='int64')
         """
         if downcast is not None:
             raise NotImplementedError(
@@ -730,74 +789,6 @@ class BaseIndex(Serializable):
             )
 
         return super().fillna(value=value)
-
-    def to_frame(self, index=True, name=no_default):
-        """Create a DataFrame with a column containing this Index
-
-        Parameters
-        ----------
-        index : boolean, default True
-            Set the index of the returned DataFrame as the original Index
-        name : object, defaults to index.name
-            The passed name should substitute for the index name (if it has
-            one).
-
-        Returns
-        -------
-        DataFrame
-            DataFrame containing the original Index data.
-
-        See Also
-        --------
-        Index.to_series : Convert an Index to a Series.
-        Series.to_frame : Convert Series to DataFrame.
-
-        Examples
-        --------
-        >>> import cudf
-        >>> idx = cudf.Index(['Ant', 'Bear', 'Cow'], name='animal')
-        >>> idx.to_frame()
-               animal
-        animal
-        Ant       Ant
-        Bear     Bear
-        Cow       Cow
-
-        By default, the original Index is reused. To enforce a new Index:
-
-        >>> idx.to_frame(index=False)
-            animal
-        0   Ant
-        1  Bear
-        2   Cow
-
-        To override the name of the resulting column, specify `name`:
-
-        >>> idx.to_frame(index=False, name='zoo')
-            zoo
-        0   Ant
-        1  Bear
-        2   Cow
-        """
-        if name is None:
-            warnings.warn(
-                "Explicitly passing `name=None` currently preserves "
-                "the Index's name or uses a default name of 0. This "
-                "behaviour is deprecated, and in the future `None` "
-                "will be used as the name of the "
-                "resulting DataFrame column.",
-                FutureWarning,
-            )
-            name = no_default
-        if name is not no_default:
-            col_name = name
-        elif self.name is None:
-            col_name = 0
-        else:
-            col_name = self.name
-        return cudf.DataFrame(
-            {col_name: self._values}, index=self if index else None
-        )
 
     def to_arrow(self):
         """Convert to a suitable Arrow object."""
@@ -810,6 +801,24 @@ class BaseIndex(Serializable):
     def to_numpy(self):
         """Convert to a numpy array."""
         raise NotImplementedError
+
+    def to_flat_index(self) -> Self:
+        """
+        Identity method.
+
+        This is implemented for compatibility with subclass implementations
+        when chaining.
+
+        Returns
+        -------
+        pd.Index
+            Caller.
+
+        See Also
+        --------
+        MultiIndex.to_flat_index : Subclass implementation.
+        """
+        return self
 
     def any(self):
         """
@@ -850,7 +859,7 @@ class BaseIndex(Serializable):
         """
         raise NotImplementedError
 
-    def to_pandas(self, nullable=False):
+    def to_pandas(self, *, nullable: bool = False, arrow_type: bool = False):
         """
         Convert to a Pandas Index.
 
@@ -864,23 +873,31 @@ class BaseIndex(Serializable):
             If ``nullable`` is ``False``, the resulting index will
             either convert null values to ``np.nan`` or ``None``
             depending on the dtype.
+        arrow_type : bool, Default False
+            Return the Index with a ``pandas.ArrowDtype``
+
+        Notes
+        -----
+        nullable and arrow_type cannot both be set to ``True``
 
         Examples
         --------
         >>> import cudf
         >>> idx = cudf.Index([-3, 10, 15, 20])
         >>> idx
-        Int64Index([-3, 10, 15, 20], dtype='int64')
+        Index([-3, 10, 15, 20], dtype='int64')
         >>> idx.to_pandas()
-        Int64Index([-3, 10, 15, 20], dtype='int64')
+        Index([-3, 10, 15, 20], dtype='int64')
         >>> type(idx.to_pandas())
-        <class 'pandas.core.indexes.numeric.Int64Index'>
+        <class 'pandas.core.indexes.base.Index'>
         >>> type(idx)
-        <class 'cudf.core.index.Int64Index'>
+        <class 'cudf.core.index.Index'>
+        >>> idx.to_pandas(arrow_type=True)
+        Index([-3, 10, 15, 20], dtype='int64[pyarrow]')
         """
         raise NotImplementedError
 
-    def isin(self, values):
+    def isin(self, values, level=None):
         """Return a boolean array where the index values are in values.
 
         Compute boolean array of whether each index value is found in
@@ -891,6 +908,9 @@ class BaseIndex(Serializable):
         ----------
         values : set, list-like, Index
             Sought values.
+        level : str or int, optional
+            Name or position of the index level to use (if the index is a
+            `MultiIndex`).
 
         Returns
         -------
@@ -901,7 +921,7 @@ class BaseIndex(Serializable):
         --------
         >>> idx = cudf.Index([1,2,3])
         >>> idx
-        Int64Index([1, 2, 3], dtype='int64')
+        Index([1, 2, 3], dtype='int64')
 
         Check whether each index value in a list of values.
 
@@ -914,7 +934,7 @@ class BaseIndex(Serializable):
         # ColumnBase.isin).
         raise NotImplementedError
 
-    def unique(self):
+    def unique(self, level: int | None = None):
         """
         Return unique values in the index.
 
@@ -971,17 +991,17 @@ class BaseIndex(Serializable):
         >>> import cudf
         >>> idx = cudf.Index([1, 2, 10, 100])
         >>> idx
-        Int64Index([1, 2, 10, 100], dtype='int64')
+        Index([1, 2, 10, 100], dtype='int64')
         >>> other = cudf.Index([200, 400, 50])
         >>> other
-        Int64Index([200, 400, 50], dtype='int64')
+        Index([200, 400, 50], dtype='int64')
         >>> idx.append(other)
-        Int64Index([1, 2, 10, 100, 200, 400, 50], dtype='int64')
+        Index([1, 2, 10, 100, 200, 400, 50], dtype='int64')
 
         append accepts list of Index objects
 
         >>> idx.append([other, other])
-        Int64Index([1, 2, 10, 100, 200, 400, 50, 200, 400, 50], dtype='int64')
+        Index([1, 2, 10, 100, 200, 400, 50, 200, 400, 50], dtype='int64')
         """
         raise NotImplementedError
 
@@ -1003,6 +1023,7 @@ class BaseIndex(Serializable):
             * None : Attempt to sort the result, but catch any TypeErrors
               from comparing incomparable elements.
             * False : Do not sort the result.
+            * True : Sort the result (which may raise TypeError).
 
         Returns
         -------
@@ -1013,39 +1034,53 @@ class BaseIndex(Serializable):
         >>> import cudf
         >>> idx1 = cudf.Index([2, 1, 3, 4])
         >>> idx1
-        Int64Index([2, 1, 3, 4], dtype='int64')
+        Index([2, 1, 3, 4], dtype='int64')
         >>> idx2 = cudf.Index([3, 4, 5, 6])
         >>> idx2
-        Int64Index([3, 4, 5, 6], dtype='int64')
+        Index([3, 4, 5, 6], dtype='int64')
         >>> idx1.difference(idx2)
-        Int64Index([1, 2], dtype='int64')
+        Index([1, 2], dtype='int64')
         >>> idx1.difference(idx2, sort=False)
-        Int64Index([2, 1], dtype='int64')
+        Index([2, 1], dtype='int64')
         """
+
         if not can_convert_to_column(other):
             raise TypeError("Input must be Index or array-like")
 
-        if sort not in {None, False}:
+        if sort not in {None, False, True}:
             raise ValueError(
                 f"The 'sort' keyword only takes the values "
-                f"of None or False; {sort} was passed."
+                f"of [None, False, True]; {sort} was passed."
             )
 
-        other = cudf.Index(other, name=getattr(other, "name", self.name))
+        if not isinstance(other, BaseIndex):
+            other = cudf.Index(
+                other,
+                name=getattr(other, "name", self.name),
+            )
 
         if not len(other):
-            return self._get_reconciled_name_object(other)
+            res = self._get_reconciled_name_object(other).unique()
+            if sort:
+                return res.sort_values()
+            return res
         elif self.equals(other):
-            return self[:0]._get_reconciled_name_object(other)
+            res = self[:0]._get_reconciled_name_object(other).unique()
+            if sort:
+                return res.sort_values()
+            return res
 
         res_name = _get_result_name(self.name, other.name)
 
-        if is_mixed_with_object_dtype(self, other):
-            difference = self.copy()
+        if is_mixed_with_object_dtype(self, other) or len(other) == 0:
+            difference = self.unique()
+            difference.name = res_name
+            if sort is True:
+                return difference.sort_values()
         else:
             other = other.copy(deep=False)
             difference = cudf.core.index._index_from_data(
-                cudf.DataFrame._from_data({"None": self._column})
+                cudf.DataFrame._from_data({"None": self._column.unique()})
                 .merge(
                     cudf.DataFrame._from_data({"None": other._column}),
                     how="leftanti",
@@ -1053,13 +1088,12 @@ class BaseIndex(Serializable):
                 )
                 ._data
             )
+            difference.name = res_name
 
             if self.dtype != other.dtype:
                 difference = difference.astype(self.dtype)
 
-        difference.name = res_name
-
-        if sort is None and len(other):
+        if sort in {None, True} and len(other):
             return difference.sort_values()
 
         return difference
@@ -1412,11 +1446,11 @@ class BaseIndex(Serializable):
         other_df["order"] = other_df.index
         res = self_df.merge(other_df, on=[0], how="outer")
         res = res.sort_values(
-            by=res._data.to_pandas_index()[1:], ignore_index=True
+            by=res._data.to_pandas_index[1:], ignore_index=True
         )
         union_result = cudf.core.index._index_from_data({0: res._data[0]})
 
-        if sort is None and len(other):
+        if sort in {None, True} and len(other):
             return union_result.sort_values()
         return union_result
 
@@ -1431,7 +1465,7 @@ class BaseIndex(Serializable):
             ._data
         )
 
-        if sort is None and len(other):
+        if sort in {None, True} and len(other):
             return intersection_result.sort_values()
         return intersection_result
 
@@ -1441,7 +1475,7 @@ class BaseIndex(Serializable):
         ascending=True,
         na_position="last",
         key=None,
-    ):
+    ) -> Self | tuple[Self, cupy.ndarray]:
         """
         Return a sorted copy of the index, and optionally return the indices
         that sorted the index itself.
@@ -1475,18 +1509,18 @@ class BaseIndex(Serializable):
         >>> import cudf
         >>> idx = cudf.Index([10, 100, 1, 1000])
         >>> idx
-        Int64Index([10, 100, 1, 1000], dtype='int64')
+        Index([10, 100, 1, 1000], dtype='int64')
 
         Sort values in ascending order (default behavior).
 
         >>> idx.sort_values()
-        Int64Index([1, 10, 100, 1000], dtype='int64')
+        Index([1, 10, 100, 1000], dtype='int64')
 
         Sort values in descending order, and also get the indices `idx` was
         sorted by.
 
         >>> idx.sort_values(ascending=False, return_indexer=True)
-        (Int64Index([1000, 100, 10, 1], dtype='int64'), array([3, 1, 0, 2],
+        (Index([1000, 100, 10, 1], dtype='int64'), array([3, 1, 0, 2],
                                                             dtype=int32))
 
         Sorting values in a MultiIndex:
@@ -1563,7 +1597,7 @@ class BaseIndex(Serializable):
                    names=['a', 'b'])
         >>> rhs = cudf.DataFrame({"a": [1, 4, 3]}).set_index('a').index
         >>> rhs
-        Int64Index([1, 4, 3], dtype='int64', name='a')
+        Index([1, 4, 3], dtype='int64', name='a')
         >>> lhs.join(rhs, how='inner')
         MultiIndex([(3, 4),
                     (1, 2)],
@@ -1598,7 +1632,7 @@ class BaseIndex(Serializable):
         # in case of MultiIndex
         if isinstance(lhs, cudf.MultiIndex):
             on = (
-                lhs._data.select_by_index(level).names[0]
+                lhs._data.get_labels_by_index(level)[0]
                 if isinstance(level, int)
                 else level
             )
@@ -1650,12 +1684,12 @@ class BaseIndex(Serializable):
         >>> import cudf
         >>> index = cudf.Index([1, 2, 3], name='one')
         >>> index
-        Int64Index([1, 2, 3], dtype='int64', name='one')
+        Index([1, 2, 3], dtype='int64', name='one')
         >>> index.name
         'one'
         >>> renamed_index = index.rename('two')
         >>> renamed_index
-        Int64Index([1, 2, 3], dtype='int64', name='two')
+        Index([1, 2, 3], dtype='int64', name='two')
         >>> renamed_index.name
         'two'
         """
@@ -1663,7 +1697,7 @@ class BaseIndex(Serializable):
             self.name = name
             return None
         else:
-            out = self.copy(deep=True)
+            out = self.copy(deep=False)
             out.name = name
             return out
 
@@ -1702,6 +1736,8 @@ class BaseIndex(Serializable):
         start = loc.start
         stop = loc.stop
         step = 1 if loc.step is None else loc.step
+        start_side: Literal["left", "right"]
+        stop_side: Literal["left", "right"]
         if step < 0:
             start_side, stop_side = "right", "left"
         else:
@@ -1725,9 +1761,9 @@ class BaseIndex(Serializable):
     def searchsorted(
         self,
         value,
-        side: builtins.str = "left",
+        side: Literal["left", "right"] = "left",
         ascending: bool = True,
-        na_position: builtins.str = "last",
+        na_position: Literal["first", "last"] = "last",
     ):
         """Find index where elements should be inserted to maintain order
 
@@ -1754,7 +1790,11 @@ class BaseIndex(Serializable):
         """
         raise NotImplementedError
 
-    def get_slice_bound(self, label, side: builtins.str, kind=None) -> int:
+    def get_slice_bound(
+        self,
+        label,
+        side: Literal["left", "right"],
+    ) -> int:
         """
         Calculate slice bound that corresponds to given label.
         Returns leftmost (one-past-the-rightmost if ``side=='right'``) position
@@ -1764,20 +1804,12 @@ class BaseIndex(Serializable):
         ----------
         label : object
         side : {'left', 'right'}
-        kind : {'ix', 'loc', 'getitem'}
 
         Returns
         -------
         int
             Index of label.
         """
-        if kind is not None:
-            # Do not remove until pandas 2.0 support is added.
-            warnings.warn(
-                "'kind' argument in get_slice_bound is deprecated and will be "
-                "removed in a future version.",
-                FutureWarning,
-            )
         if side not in {"left", "right"}:
             raise ValueError(f"Invalid side argument {side}")
         if self.is_monotonic_increasing or self.is_monotonic_decreasing:
@@ -1836,7 +1868,7 @@ class BaseIndex(Serializable):
             return NotImplemented
 
     @classmethod
-    def from_pandas(cls, index, nan_as_null=no_default):
+    def from_pandas(cls, index: pd.Index, nan_as_null=no_default):
         """
         Convert from a Pandas Index.
 
@@ -1862,9 +1894,9 @@ class BaseIndex(Serializable):
         >>> data = [10, 20, 30, np.nan]
         >>> pdi = pd.Index(data)
         >>> cudf.Index.from_pandas(pdi)
-        Float64Index([10.0, 20.0, 30.0, <NA>], dtype='float64')
+        Index([10.0, 20.0, 30.0, <NA>], dtype='float64')
         >>> cudf.Index.from_pandas(pdi, nan_as_null=False)
-        Float64Index([10.0, 20.0, 30.0, nan], dtype='float64')
+        Index([10.0, 20.0, 30.0, nan], dtype='float64')
         """
         if nan_as_null is no_default:
             nan_as_null = (
@@ -1873,10 +1905,18 @@ class BaseIndex(Serializable):
 
         if not isinstance(index, pd.Index):
             raise TypeError("not a pandas.Index")
-
-        ind = cudf.Index(column.as_column(index, nan_as_null=nan_as_null))
-        ind.name = index.name
-        return ind
+        if isinstance(index, pd.RangeIndex):
+            return cudf.RangeIndex(
+                start=index.start,
+                stop=index.stop,
+                step=index.step,
+                name=index.name,
+            )
+        else:
+            return cudf.Index._from_column(
+                column.as_column(index, nan_as_null=nan_as_null),
+                name=index.name,
+            )
 
     @property
     def _constructor_expanddim(self):
@@ -1901,16 +1941,18 @@ class BaseIndex(Serializable):
         # This utilizes the fact that all `Index` is also a `Frame`.
         # Except RangeIndex.
         return self._from_columns_like_self(
-            drop_duplicates(
-                list(self._columns),
-                keys=range(len(self._data)),
-                keep=keep,
-                nulls_are_equal=nulls_are_equal,
-            ),
+            [
+                ColumnBase.from_pylibcudf(col)
+                for col in stream_compaction.drop_duplicates(
+                    list(self._columns),
+                    keep=keep,
+                    nulls_are_equal=nulls_are_equal,
+                )
+            ],
             self._column_names,
         )
 
-    def duplicated(self, keep="first"):
+    def duplicated(self, keep="first") -> cupy.ndarray:
         """
         Indicate duplicate index values.
 
@@ -1977,22 +2019,25 @@ class BaseIndex(Serializable):
             one null value. "all" drops only rows containing
             *all* null values.
         """
-
+        if how not in {"any", "all"}:
+            raise ValueError(f"{how=} must be 'any' or 'all'")
+        try:
+            if not self.hasnans:
+                return self.copy(deep=False)
+        except NotImplementedError:
+            pass
         # This is to be consistent with IndexedFrame.dropna to handle nans
         # as nulls by default
-        data_columns = [
-            col.nans_to_nulls()
-            if isinstance(col, cudf.core.column.NumericalColumn)
-            else col
-            for col in self._columns
-        ]
+        data_columns = [col.nans_to_nulls() for col in self._columns]
 
         return self._from_columns_like_self(
-            drop_nulls(
-                data_columns,
-                how=how,
-                keys=range(len(data_columns)),
-            ),
+            [
+                ColumnBase.from_pylibcudf(col)
+                for col in stream_compaction.drop_nulls(
+                    data_columns,
+                    how=how,
+                )
+            ],
             self._column_names,
         )
 
@@ -2006,16 +2051,17 @@ class BaseIndex(Serializable):
 
         # TODO: For performance, the check and conversion of gather map should
         # be done by the caller. This check will be removed in future release.
-        if not is_integer_dtype(gather_map.dtype):
-            gather_map = gather_map.astype(size_type_dtype)
+        if gather_map.dtype.kind not in "iu":
+            gather_map = gather_map.astype(SIZE_TYPE_DTYPE)
 
-        if not _gather_map_is_valid(
-            gather_map, len(self), check_bounds, nullify
-        ):
-            raise IndexError("Gather map index is out of bounds.")
-
+        GatherMap(gather_map, len(self), nullify=not check_bounds or nullify)
         return self._from_columns_like_self(
-            gather(list(self._columns), gather_map, nullify=nullify),
+            [
+                ColumnBase.from_pylibcudf(col)
+                for col in copying.gather(
+                    self._columns, gather_map, nullify=nullify
+                )
+            ],
             self._column_names,
         )
 
@@ -2040,7 +2086,7 @@ class BaseIndex(Serializable):
         --------
         >>> idx = cudf.Index(['a', 'b', 'c', 'd', 'e'])
         >>> idx.take([2, 0, 4, 3])
-        StringIndex(['c' 'a' 'e' 'd'], dtype='object')
+        Index(['c', 'a', 'e', 'd'], dtype='object')
         """
 
         if axis not in {0, "index"}:
@@ -2060,11 +2106,16 @@ class BaseIndex(Serializable):
         Rows corresponding to `False` is dropped.
         """
         boolean_mask = cudf.core.column.as_column(boolean_mask)
-        if not is_bool_dtype(boolean_mask.dtype):
+        if boolean_mask.dtype.kind != "b":
             raise ValueError("boolean_mask is not boolean type.")
 
         return self._from_columns_like_self(
-            apply_boolean_mask(list(self._columns), boolean_mask),
+            [
+                ColumnBase.from_pylibcudf(col)
+                for col in stream_compaction.apply_boolean_mask(
+                    list(self._columns), boolean_mask
+                )
+            ],
             column_names=self._column_names,
         )
 
@@ -2091,22 +2142,28 @@ class BaseIndex(Serializable):
         --------
         >>> index = cudf.Index([10, 22, 33, 55])
         >>> index
-        Int64Index([10, 22, 33, 55], dtype='int64')
+        Index([10, 22, 33, 55], dtype='int64')
         >>> index.repeat(5)
-        Int64Index([10, 10, 10, 10, 10, 22, 22, 22, 22, 22, 33,
+        Index([10, 10, 10, 10, 10, 22, 22, 22, 22, 22, 33,
                     33, 33, 33, 33, 55, 55, 55, 55, 55],
                 dtype='int64')
         """
         raise NotImplementedError
 
-    def _split_columns_by_levels(self, levels):
-        if isinstance(levels, int) and levels > 0:
-            raise ValueError(f"Out of bound level: {levels}")
-        return (
-            [self._data[self.name]],
-            [],
-            ["index" if self.name is None else self.name],
-            [],
+    def _new_index_for_reset_index(
+        self, levels: tuple | None, name
+    ) -> None | BaseIndex:
+        """Return the new index after .reset_index"""
+        # None is caught later to return RangeIndex
+        return None
+
+    def _columns_for_reset_index(
+        self, levels: tuple | None
+    ) -> Generator[tuple[Any, ColumnBase], None, None]:
+        """Return the columns and column names for .reset_index"""
+        yield (
+            "index" if self.name is None else self.name,
+            next(iter(self._columns)),
         )
 
     def _split(self, splits):
@@ -2115,3 +2172,9 @@ class BaseIndex(Serializable):
 
 def _get_result_name(left_name, right_name):
     return left_name if _is_same_name(left_name, right_name) else None
+
+
+def _return_get_indexer_result(result: cupy.ndarray) -> cupy.ndarray:
+    if cudf.get_option("mode.pandas_compatible"):
+        return result.astype(np.dtype(np.int64))
+    return result

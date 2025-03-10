@@ -1,11 +1,12 @@
-# Copyright (c) 2018-2023, NVIDIA CORPORATION.
+# Copyright (c) 2018-2024, NVIDIA CORPORATION.
 import cupy
 import numpy as np
 import pandas as pd
 import pytest
 
 import cudf
-from cudf.testing._utils import assert_eq, gen_rand, random_bitmask
+from cudf.testing import assert_eq
+from cudf.testing._utils import gen_rand, random_bitmask
 
 
 @pytest.mark.parametrize("side", ["left", "right"])
@@ -38,7 +39,10 @@ def test_searchsorted(side, obj_class, vals_class):
     pvals = vals.to_pandas()
 
     expect = psr.searchsorted(pvals, side)
-    got = sr.searchsorted(vals, side)
+    if obj_class == "column":
+        got = sr.searchsorted(vals._column, side)
+    else:
+        got = sr.searchsorted(vals, side)
 
     assert_eq(expect, cupy.asnumpy(got))
 
@@ -83,7 +87,6 @@ def test_search_sorted_dataframe_unequal_number_of_columns():
 
 @pytest.mark.parametrize("side", ["left", "right"])
 def test_searchsorted_categorical(side):
-
     cat1 = pd.Categorical(
         ["a", "a", "b", "c", "a"], categories=["a", "b", "c"], ordered=True
     )
@@ -103,7 +106,6 @@ def test_searchsorted_categorical(side):
 
 @pytest.mark.parametrize("side", ["left", "right"])
 def test_searchsorted_datetime(side):
-
     psr1 = pd.Series(
         pd.date_range("20190101", "20200101", freq="400h", name="times")
     )

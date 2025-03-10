@@ -1,5 +1,5 @@
 # =============================================================================
-# Copyright (c) 2019-2023, NVIDIA CORPORATION.
+# Copyright (c) 2019-2025, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License. You may obtain a copy of the License at
@@ -11,9 +11,9 @@
 # or implied. See the License for the specific language governing permissions and limitations under
 # the License.
 # =============================================================================
-cmake_minimum_required(VERSION 3.26.4 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
-include(../../../../fetch_rapids.cmake)
+include(../../../../rapids_config.cmake)
 include(rapids-cmake)
 include(rapids-cuda)
 include(rapids-find)
@@ -28,7 +28,7 @@ rapids_cuda_init_architectures(CUDF_JNI)
 
 project(
   CUDF_JNI
-  VERSION 23.10.00
+  VERSION "${RAPIDS_VERSION}"
   LANGUAGES C CXX CUDA
 )
 
@@ -43,6 +43,7 @@ option(CUDA_STATIC_RUNTIME "Statically link the CUDA runtime" OFF)
 option(USE_GDS "Build with GPUDirect Storage (GDS)/cuFile support" OFF)
 option(CUDF_JNI_LIBCUDF_STATIC "Link with libcudf.a" OFF)
 option(CUDF_JNI_ENABLE_PROFILING "Build with profiling support" ON)
+option(CUDA_STATIC_CUFILE "Statically link cuFile" OFF)
 
 message(VERBOSE "CUDF_JNI: Build with NVTX support: ${USE_NVTX}")
 message(VERBOSE "CUDF_JNI: Build cuDF JNI shared libraries: ${BUILD_SHARED_LIBS}")
@@ -95,6 +96,10 @@ set(cudf_ROOT "${CUDF_CPP_BUILD_DIR}")
 rapids_find_package(cudf REQUIRED)
 
 # ##################################################################################################
+# * nvtx3-------------------------------------------------------------------------------------------
+include(${CUDF_SOURCE_DIR}/cmake/thirdparty/get_nvtx.cmake)
+
+# ##################################################################################################
 # * nvcomp------------------------------------------------------------------------------------------
 
 if(NOT DEFINED nvcomp_DIR)
@@ -116,7 +121,12 @@ endif()
 
 if(USE_GDS)
   message(STATUS "Building with GPUDirect Storage (GDS)/cuFile support")
-  find_package(cuFile REQUIRED)
+  if(CUDA_STATIC_CUFILE)
+    set(_cufile_suffix _static)
+  endif()
+  if(NOT TARGET CUDA::cuFile${_cufile_suffix})
+    message(FATAL_ERROR "cuFile support not found")
+  endif()
 endif()
 
 # ##################################################################################################
@@ -135,8 +145,10 @@ add_library(
   src/ColumnViewJni.cu
   src/CompiledExpression.cpp
   src/ContiguousTableJni.cpp
+  src/DataSourceHelperJni.cpp
   src/HashJoinJni.cpp
   src/HostMemoryBufferNativeUtilsJni.cpp
+  src/HostUDFWrapperJni.cpp
   src/NvcompJni.cpp
   src/NvtxRangeJni.cpp
   src/NvtxUniqueRangeJni.cpp
@@ -145,9 +157,9 @@ add_library(
   src/ScalarJni.cpp
   src/TableJni.cpp
   src/aggregation128_utils.cu
-  src/maps_column_view.cu
-  src/row_conversion.cu
   src/check_nvcomp_output_sizes.cu
+  src/maps_column_view.cu
+  src/multi_host_buffer_source.cpp
 )
 
 # Disable NVTX if necessary
@@ -206,6 +218,11 @@ target_compile_definitions(
   cudfjni PUBLIC "$<$<COMPILE_LANGUAGE:CXX>:${CUDF_CXX_DEFINITIONS}>"
                  "$<$<COMPILE_LANGUAGE:CUDA>:${CUDF_CUDA_DEFINITIONS}>"
 )
+target_link_options(cudfjni PRIVATE "-Wl,--no-undefined")
+
+set(CUDF_ENABLE_ARROW_PARQUET ON)
+include(../../../../cpp/cmake/thirdparty/get_arrow.cmake)
+target_link_libraries(cudfjni PRIVATE ${ARROW_LIBRARIES})
 
 if(USE_GDS)
   add_library(cufilejni src/CuFileJni.cpp)
@@ -219,8 +236,7 @@ if(USE_GDS)
                POSITION_INDEPENDENT_CODE ON
                INTERFACE_POSITION_INDEPENDENT_CODE ON
   )
-  target_include_directories(cufilejni PRIVATE "${cuFile_INCLUDE_DIRS}")
-  target_link_libraries(cufilejni PRIVATE cudfjni "${cuFile_LIBRARIES}")
+  target_link_libraries(cufilejni PRIVATE cudfjni CUDA::cuFile${_cufile_suffix})
 endif()
 
 # ##################################################################################################
@@ -235,7 +251,7 @@ endif()
 # When nvcomp is installed we need to use nvcomp::nvcomp but from the cudf build directory it will
 # just be nvcomp.
 target_link_libraries(
-  cudfjni ${CUDF_LINK} PRIVATE $<TARGET_NAME_IF_EXISTS:nvcomp>
+  cudfjni ${CUDF_LINK} PRIVATE nvtx3::nvtx3-cpp $<TARGET_NAME_IF_EXISTS:nvcomp>
                                $<TARGET_NAME_IF_EXISTS:nvcomp::nvcomp>
 )
 
@@ -258,9 +274,8 @@ if(TARGET nvcomp::nvcomp)
   add_custom_command(
     TARGET cudfjni
     PRE_LINK
-    COMMAND
-      ${CMAKE_COMMAND} -E copy $<TARGET_FILE:nvcomp::nvcomp> $<TARGET_FILE:nvcomp::nvcomp_gdeflate>
-      $<TARGET_FILE:nvcomp::nvcomp_bitcomp> "${PROJECT_BINARY_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:nvcomp::nvcomp>
+            "${PROJECT_BINARY_DIR}/libnvcomp.so"
     COMMENT "Copying nvcomp libraries to ${PROJECT_BINARY_DIR}"
   )
 endif()

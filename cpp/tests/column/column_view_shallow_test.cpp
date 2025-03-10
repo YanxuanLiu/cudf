@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,14 @@
  * limitations under the License.
  */
 
+#include <cudf_test/base_fixture.hpp>
+#include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/type_lists.hpp>
+
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
-
-#include <cudf_test/base_fixture.hpp>
-#include <cudf_test/column_utilities.hpp>
-#include <cudf_test/column_wrapper.hpp>
-#include <cudf_test/cudf_gtest.hpp>
-#include <cudf_test/type_lists.hpp>
 
 #include <thrust/iterator/counting_iterator.h>
 
@@ -43,7 +41,8 @@ template <typename T, std::enable_if_t<cudf::is_dictionary<T>()>* = nullptr>
 std::unique_ptr<cudf::column> example_column()
 {
   return cudf::test::dictionary_column_wrapper<std::string>(
-           {"fff", "aaa", "ddd", "bbb", "ccc", "ccc", "ccc", "", ""}, {1, 1, 1, 1, 1, 1, 1, 1, 0})
+           {"fff", "aaa", "ddd", "bbb", "ccc", "ccc", "ccc", "", ""},
+           {true, true, true, true, true, true, true, true, false})
     .release();
 }
 

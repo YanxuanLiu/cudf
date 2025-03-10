@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,12 +17,14 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/testing_main.hpp>
 #include <cudf_test/type_lists.hpp>
 
-#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/search.hpp>
 
 #include <thrust/iterator/transform_iterator.h>
+
+#include <numeric>
 
 struct SearchTest : public cudf::test::BaseFixture {};
 

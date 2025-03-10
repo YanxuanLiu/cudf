@@ -22,6 +22,7 @@ Attributes
    Series.values
    Series.data
    Series.dtype
+   Series.dtypes
    Series.shape
    Series.ndim
    Series.nullable
@@ -68,6 +69,7 @@ Indexing, iteration
    Series.items
    Series.iteritems
    Series.keys
+   Series.squeeze
 
 Binary operator functions
 -------------------------
@@ -137,6 +139,7 @@ Computations / descriptive stats
    Series.describe
    Series.diff
    Series.digitize
+   Series.ewm
    Series.factorize
    Series.kurt
    Series.max
@@ -158,7 +161,6 @@ Computations / descriptive stats
    Series.unique
    Series.nunique
    Series.is_unique
-   Series.is_monotonic
    Series.is_monotonic_increasing
    Series.is_monotonic_decreasing
    Series.value_counts
@@ -226,7 +228,6 @@ Combining / comparing / joining / merging
 .. autosummary::
    :toctree: api/
 
-   Series.append
    Series.update
 
 Time Series-related
@@ -403,3 +404,5 @@ Serialization / IO / conversion
    Series.from_masked_array
    Series.from_pandas
    Series.hash_values
+   Series.to_pylibcudf
+   Series.from_pylibcudf
