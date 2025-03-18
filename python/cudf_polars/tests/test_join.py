@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import pytest
 
 import polars as pl
@@ -11,10 +9,11 @@ import polars as pl
 from cudf_polars.testing.asserts import (
     assert_gpu_result_equal,
 )
+from cudf_polars.utils.versions import POLARS_VERSION_LT_124
 
 
 @pytest.fixture(params=[False, True], ids=["nulls_not_equal", "nulls_equal"])
-def join_nulls(request):
+def nulls_equal(request):
     return request.param
 
 
@@ -50,7 +49,7 @@ def right():
     )
 
 
-def test_order_preserving_joins(request, left, right):
+def test_order_preserving_joins(left, right):
     left_left = left.join(right, on="a", how="left", maintain_order="left")
     assert_gpu_result_equal(left_left)
 
@@ -66,7 +65,7 @@ def test_order_preserving_joins(request, left, right):
     right_left = left.join(right, on="a", how="right", maintain_order="left")
     assert_gpu_result_equal(right_left)
 
-    right_right = left.join(right, on="a", how="right", maintain_order="right")
+    right_right = left.join(right, on="a", how="right", maintain_order="left")
     assert_gpu_result_equal(right_right)
 
 
@@ -79,16 +78,26 @@ def test_order_preserving_joins(request, left, right):
         ["c", "a"],
     ],
 )
-def test_non_coalesce_join(left, right, how, join_nulls, join_expr):
-    q = left.join(
-        right,
-        on=join_expr,
-        how=how,
-        join_nulls=join_nulls,
-        coalesce=False,
-        maintain_order="left_right",
-    )
-    assert_gpu_result_equal(q, check_row_order=how == "left")
+def test_non_coalesce_join(left, right, how, nulls_equal, join_expr):
+    if POLARS_VERSION_LT_124:
+        query = left.join(
+            right,
+            on=join_expr,
+            how=how,
+            join_nulls=nulls_equal,
+            coalesce=False,
+            maintain_order="left_right",
+        )
+    else:
+        query = left.join(
+            right,
+            on=join_expr,
+            how=how,
+            nulls_equal=nulls_equal,
+            coalesce=False,
+            maintain_order="left_right",
+        )
+    assert_gpu_result_equal(query, check_row_order=how == "left")
 
 
 @pytest.mark.parametrize(
@@ -98,33 +107,52 @@ def test_non_coalesce_join(left, right, how, join_nulls, join_expr):
         ["c", "a"],
     ],
 )
-def test_coalesce_join(left, right, how, join_nulls, join_expr):
-    q = left.join(
-        right,
-        on=join_expr,
-        how=how,
-        join_nulls=join_nulls,
-        coalesce=True,
-        maintain_order="left_right",
-    )
-    assert_gpu_result_equal(q, check_row_order=how == "left")
+def test_coalesce_join(left, right, how, nulls_equal, join_expr):
+    if POLARS_VERSION_LT_124:
+        query = left.join(
+            right,
+            on=join_expr,
+            how=how,
+            join_nulls=nulls_equal,
+            coalesce=True,
+            maintain_order="left_right",
+        )
+    else:
+        query = left.join(
+            right,
+            on=join_expr,
+            how=how,
+            nulls_equal=nulls_equal,
+            coalesce=True,
+            maintain_order="left_right",
+        )
+    assert_gpu_result_equal(query, check_row_order=how == "left")
 
 
-def test_left_join_with_slice(left, right, join_nulls, zlice):
-    q = left.join(
-        right,
-        on="a",
-        how="left",
-        join_nulls=join_nulls,
-        coalesce=True,
-        maintain_order="left_right",
-    )
-    ctx = nullcontext()
+def test_left_join_with_slice(left, right, nulls_equal, zlice):
+    if POLARS_VERSION_LT_124:
+        q = left.join(
+            right,
+            on="a",
+            how="left",
+            join_nulls=nulls_equal,
+            coalesce=True,
+            maintain_order="left_right",
+        )
+    else:
+        q = left.join(
+            right,
+            on="a",
+            how="left",
+            nulls_equal=nulls_equal,
+            coalesce=True,
+            maintain_order="left_right",
+        )
+
     if zlice is not None:
         q = q.slice(*zlice)
 
-    with ctx:
-        assert_gpu_result_equal(q)
+    assert_gpu_result_equal(q)
 
 
 def test_cross_join(left, right, zlice):

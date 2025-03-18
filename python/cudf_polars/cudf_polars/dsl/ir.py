@@ -38,7 +38,8 @@ if TYPE_CHECKING:
 
     from polars.polars import _expr_nodes as pl_expr
 
-    from cudf_polars.typing import Schema
+    from cudf_polars.typing import Schema, Slice as Zlice
+    from cudf_polars.utils.config import ConfigOptions
 
 
 __all__ = [
@@ -100,7 +101,7 @@ def broadcast(*columns: Column, target_length: int | None = None) -> list[Column
     """
     if len(columns) == 0:
         return []
-    lengths: set[int] = {column.obj.size() for column in columns}
+    lengths: set[int] = {column.size for column in columns}
     if lengths == {1}:
         if target_length is None:
             return list(columns)
@@ -116,7 +117,7 @@ def broadcast(*columns: Column, target_length: int | None = None) -> list[Column
             )
     return [
         column
-        if column.obj.size() != 1
+        if column.size != 1
         else Column(
             plc.Column.from_scalar(column.obj_scalar, nrows),
             is_sorted=plc.types.Sorted.YES,
@@ -284,7 +285,7 @@ class Scan(IR):
     """Reader-specific options, as dictionary."""
     cloud_options: dict[str, Any] | None
     """Cloud-related authentication options, currently ignored."""
-    config_options: dict[str, Any]
+    config_options: ConfigOptions
     """GPU-specific configuration options"""
     paths: list[str]
     """List of paths to read from."""
@@ -308,7 +309,7 @@ class Scan(IR):
         typ: str,
         reader_options: dict[str, Any],
         cloud_options: dict[str, Any] | None,
-        config_options: dict[str, Any],
+        config_options: ConfigOptions,
         paths: list[str],
         with_columns: list[str] | None,
         skip_rows: int,
@@ -413,7 +414,7 @@ class Scan(IR):
             self.typ,
             json.dumps(self.reader_options),
             json.dumps(self.cloud_options),
-            json.dumps(self.config_options),
+            self.config_options,
             tuple(self.paths),
             tuple(self.with_columns) if self.with_columns is not None else None,
             self.skip_rows,
@@ -428,7 +429,7 @@ class Scan(IR):
         schema: Schema,
         typ: str,
         reader_options: dict[str, Any],
-        config_options: dict[str, Any],
+        config_options: ConfigOptions,
         paths: list[str],
         with_columns: list[str] | None,
         skip_rows: int,
@@ -516,8 +517,7 @@ class Scan(IR):
                 colnames[0],
             )
         elif typ == "parquet":
-            parquet_options = config_options.get("parquet_options", {})
-            if parquet_options.get("chunked", True):
+            if config_options.get("parquet_options.chunked", default=True):
                 options = plc.io.parquet.ParquetReaderOptions.builder(
                     plc.io.SourceInfo(paths)
                 ).build()
@@ -534,11 +534,13 @@ class Scan(IR):
                     options.set_columns(with_columns)
                 reader = plc.io.parquet.ChunkedParquetReader(
                     options,
-                    chunk_read_limit=parquet_options.get(
-                        "chunk_read_limit", cls.PARQUET_DEFAULT_CHUNK_SIZE
+                    chunk_read_limit=config_options.get(
+                        "parquet_options.chunk_read_limit",
+                        default=cls.PARQUET_DEFAULT_CHUNK_SIZE,
                     ),
-                    pass_read_limit=parquet_options.get(
-                        "pass_read_limit", cls.PARQUET_DEFAULT_PASS_LIMIT
+                    pass_read_limit=config_options.get(
+                        "parquet_options.pass_read_limit",
+                        default=cls.PARQUET_DEFAULT_PASS_LIMIT,
                     ),
                 )
                 chk = reader.read_chunk()
@@ -696,15 +698,13 @@ class DataFrameScan(IR):
     This typically arises from ``q.collect().lazy()``
     """
 
-    __slots__ = ("config_options", "df", "predicate", "projection")
-    _non_child = ("schema", "df", "projection", "predicate", "config_options")
+    __slots__ = ("config_options", "df", "projection")
+    _non_child = ("schema", "df", "projection", "config_options")
     df: Any
     """Polars LazyFrame object."""
     projection: tuple[str, ...] | None
     """List of columns to project out."""
-    predicate: expr.NamedExpr | None
-    """Mask to apply."""
-    config_options: dict[str, Any]
+    config_options: ConfigOptions
     """GPU-specific configuration options"""
 
     def __init__(
@@ -712,15 +712,17 @@ class DataFrameScan(IR):
         schema: Schema,
         df: Any,
         projection: Sequence[str] | None,
-        predicate: expr.NamedExpr | None,
-        config_options: dict[str, Any],
+        config_options: ConfigOptions,
     ):
         self.schema = schema
         self.df = df
         self.projection = tuple(projection) if projection is not None else None
-        self.predicate = predicate
         self.config_options = config_options
-        self._non_child_args = (schema, df, self.projection, predicate)
+        self._non_child_args = (
+            schema,
+            pl.DataFrame._from_pydf(df),
+            self.projection,
+        )
         self.children = ()
 
     def get_hashable(self) -> Hashable:
@@ -736,8 +738,7 @@ class DataFrameScan(IR):
             schema_hash,
             id(self.df),
             self.projection,
-            self.predicate,
-            json.dumps(self.config_options),
+            self.config_options,
         )
 
     @classmethod
@@ -746,13 +747,11 @@ class DataFrameScan(IR):
         schema: Schema,
         df: Any,
         projection: tuple[str, ...] | None,
-        predicate: expr.NamedExpr | None,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
-        pdf = pl.DataFrame._from_pydf(df)
         if projection is not None:
-            pdf = pdf.select(projection)
-        df = DataFrame.from_polars(pdf)
+            df = df.select(projection)
+        df = DataFrame.from_polars(df)
         assert all(
             c.obj.type() == dtype
             for c, dtype in zip(df.columns, schema.values(), strict=True)
@@ -826,29 +825,61 @@ class Reduce(IR):
     ) -> DataFrame:  # pragma: no cover; not exposed by polars yet
         """Evaluate and return a dataframe."""
         columns = broadcast(*(e.evaluate(df) for e in exprs))
-        assert all(column.obj.size() == 1 for column in columns)
+        assert all(column.size == 1 for column in columns)
         return DataFrame(columns)
 
 
 class GroupBy(IR):
     """Perform a groupby."""
 
+    class AggInfos:
+        """Serializable wrapper for GroupBy aggregation info."""
+
+        agg_requests: Sequence[expr.NamedExpr]
+        agg_infos: Sequence[expr.AggInfo]
+
+        def __init__(self, agg_requests: Sequence[expr.NamedExpr]):
+            self.agg_requests = tuple(agg_requests)
+            self.agg_infos = [req.collect_agg(depth=0) for req in self.agg_requests]
+
+        def __reduce__(self):
+            """Pickle an AggInfos object."""
+            return (type(self), (self.agg_requests,))
+
+    class GroupbyOptions:
+        """Serializable wrapper for polars GroupbyOptions."""
+
+        def __init__(self, polars_groupby_options: Any):
+            self.dynamic = polars_groupby_options.dynamic
+            self.rolling = polars_groupby_options.rolling
+            self.slice = polars_groupby_options.slice
+
     __slots__ = (
         "agg_infos",
         "agg_requests",
+        "config_options",
         "keys",
         "maintain_order",
         "options",
     )
-    _non_child = ("schema", "keys", "agg_requests", "maintain_order", "options")
+    _non_child = (
+        "schema",
+        "keys",
+        "agg_requests",
+        "maintain_order",
+        "options",
+        "config_options",
+    )
     keys: tuple[expr.NamedExpr, ...]
     """Grouping keys."""
     agg_requests: tuple[expr.NamedExpr, ...]
     """Aggregation expressions."""
     maintain_order: bool
     """Preserve order in groupby."""
-    options: Any
+    options: GroupbyOptions
     """Arbitrary options."""
+    config_options: ConfigOptions
+    """GPU-specific configuration options"""
 
     def __init__(
         self,
@@ -857,13 +888,15 @@ class GroupBy(IR):
         agg_requests: Sequence[expr.NamedExpr],
         maintain_order: bool,  # noqa: FBT001
         options: Any,
+        config_options: ConfigOptions,
         df: IR,
     ):
         self.schema = schema
         self.keys = tuple(keys)
         self.agg_requests = tuple(agg_requests)
         self.maintain_order = maintain_order
-        self.options = options
+        self.options = self.GroupbyOptions(options)
+        self.config_options = config_options
         self.children = (df,)
         if self.options.rolling:
             raise NotImplementedError(
@@ -873,13 +906,12 @@ class GroupBy(IR):
             raise NotImplementedError("dynamic group by")
         if any(GroupBy.check_agg(a.value) > 1 for a in self.agg_requests):
             raise NotImplementedError("Nested aggregations in groupby")
-        self.agg_infos = [req.collect_agg(depth=0) for req in self.agg_requests]
         self._non_child_args = (
             self.keys,
             self.agg_requests,
             maintain_order,
-            options,
-            self.agg_infos,
+            self.options,
+            self.AggInfos(self.agg_requests),
         )
 
     @staticmethod
@@ -916,8 +948,8 @@ class GroupBy(IR):
         keys_in: Sequence[expr.NamedExpr],
         agg_requests: Sequence[expr.NamedExpr],
         maintain_order: bool,  # noqa: FBT001
-        options: Any,
-        agg_infos: Sequence[expr.AggInfo],
+        options: GroupbyOptions,
+        agg_info_wrapper: AggInfos,
         df: DataFrame,
     ):
         """Evaluate and return a dataframe."""
@@ -937,7 +969,7 @@ class GroupBy(IR):
         # TODO: uniquify
         requests = []
         replacements: list[expr.Expr] = []
-        for info in agg_infos:
+        for info in agg_info_wrapper.agg_infos:
             for pre_eval, req, rep in info.requests:
                 if pre_eval is None:
                     # A count aggregation, doesn't touch the column,
@@ -1008,6 +1040,20 @@ class GroupBy(IR):
 class ConditionalJoin(IR):
     """A conditional inner join of two dataframes on a predicate."""
 
+    class Predicate:
+        """Serializable wrapper for a predicate expression."""
+
+        predicate: expr.Expr
+        ast: plc.expressions.Expression
+
+        def __init__(self, predicate: expr.Expr):
+            self.predicate = predicate
+            self.ast = to_ast(predicate)
+
+        def __reduce__(self):
+            """Pickle a Predicate object."""
+            return (type(self), (self.predicate,))
+
     __slots__ = ("ast_predicate", "options", "predicate")
     _non_child = ("schema", "predicate", "options")
     predicate: expr.Expr
@@ -1018,7 +1064,7 @@ class ConditionalJoin(IR):
             pl_expr.Operator | Iterable[pl_expr.Operator],
         ],
         bool,
-        tuple[int, int] | None,
+        Zlice | None,
         str,
         bool,
         Literal["none", "left", "right", "left_right", "right_left"],
@@ -1026,7 +1072,7 @@ class ConditionalJoin(IR):
     """
     tuple of options:
     - predicates: tuple of ir join type (eg. ie_join) and (In)Equality conditions
-    - join_nulls: do nulls compare equal?
+    - nulls_equal: do nulls compare equal?
     - slice: optional slice to perform after joining.
     - suffix: string suffix for right columns if names match
     - coalesce: should key columns be coalesced (only makes sense for outer joins)
@@ -1040,30 +1086,34 @@ class ConditionalJoin(IR):
         self.predicate = predicate
         self.options = options
         self.children = (left, right)
-        self.ast_predicate = to_ast(predicate)
-        _, join_nulls, zlice, suffix, coalesce, maintain_order = self.options
+        predicate_wrapper = self.Predicate(predicate)
+        _, nulls_equal, zlice, suffix, coalesce, maintain_order = self.options
         # Preconditions from polars
-        assert not join_nulls
+        assert not nulls_equal
         assert not coalesce
         assert maintain_order == "none"
-        if self.ast_predicate is None:
+        if predicate_wrapper.ast is None:
             raise NotImplementedError(
                 f"Conditional join with predicate {predicate}"
             )  # pragma: no cover; polars never delivers expressions we can't handle
-        self._non_child_args = (self.ast_predicate, zlice, suffix, maintain_order)
+        self._non_child_args = (predicate_wrapper, zlice, suffix, maintain_order)
 
     @classmethod
     def do_evaluate(
         cls,
-        predicate: plc.expressions.Expression,
-        zlice: tuple[int, int] | None,
+        predicate_wrapper: Predicate,
+        zlice: Zlice | None,
         suffix: str,
         maintain_order: Literal["none", "left", "right", "left_right", "right_left"],
         left: DataFrame,
         right: DataFrame,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
-        lg, rg = plc.join.conditional_inner_join(left.table, right.table, predicate)
+        lg, rg = plc.join.conditional_inner_join(
+            left.table,
+            right.table,
+            predicate_wrapper.ast,
+        )
         left = DataFrame.from_table(
             plc.copying.gather(
                 left.table, lg, plc.copying.OutOfBoundsPolicy.DONT_CHECK
@@ -1090,8 +1140,8 @@ class ConditionalJoin(IR):
 class Join(IR):
     """A join of two dataframes."""
 
-    __slots__ = ("left_on", "options", "right_on")
-    _non_child = ("schema", "left_on", "right_on", "options")
+    __slots__ = ("config_options", "left_on", "options", "right_on")
+    _non_child = ("schema", "left_on", "right_on", "options", "config_options")
     left_on: tuple[expr.NamedExpr, ...]
     """List of expressions used as keys in the left frame."""
     right_on: tuple[expr.NamedExpr, ...]
@@ -1099,7 +1149,7 @@ class Join(IR):
     options: tuple[
         Literal["Inner", "Left", "Right", "Full", "Semi", "Anti", "Cross"],
         bool,
-        tuple[int, int] | None,
+        Zlice | None,
         str,
         bool,
         Literal["none", "left", "right", "left_right", "right_left"],
@@ -1107,12 +1157,14 @@ class Join(IR):
     """
     tuple of options:
     - how: join type
-    - join_nulls: do nulls compare equal?
+    - nulls_equal: do nulls compare equal?
     - slice: optional slice to perform after joining.
     - suffix: string suffix for right columns if names match
     - coalesce: should key columns be coalesced (only makes sense for outer joins)
     - maintain_order: which DataFrame row order to preserve, if any
     """
+    config_options: ConfigOptions
+    """GPU-specific configuration options"""
 
     def __init__(
         self,
@@ -1120,6 +1172,7 @@ class Join(IR):
         left_on: Sequence[expr.NamedExpr],
         right_on: Sequence[expr.NamedExpr],
         options: Any,
+        config_options: ConfigOptions,
         left: IR,
         right: IR,
     ):
@@ -1127,6 +1180,7 @@ class Join(IR):
         self.left_on = tuple(left_on)
         self.right_on = tuple(right_on)
         self.options = options
+        self.config_options = config_options
         self.children = (left, right)
         self._non_child_args = (self.left_on, self.right_on, self.options)
 
@@ -1252,7 +1306,7 @@ class Join(IR):
         options: tuple[
             Literal["Inner", "Left", "Right", "Full", "Semi", "Anti", "Cross"],
             bool,
-            tuple[int, int] | None,
+            Zlice | None,
             str,
             bool,
             Literal["none", "left", "right", "left_right", "right_left"],
@@ -1261,7 +1315,7 @@ class Join(IR):
         right: DataFrame,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
-        how, join_nulls, zlice, suffix, coalesce, maintain_order = options
+        how, nulls_equal, zlice, suffix, coalesce, maintain_order = options
         if how == "Cross":
             # Separate implementation, since cross_join returns the
             # result, not the gather maps
@@ -1289,7 +1343,7 @@ class Join(IR):
         right_on = DataFrame(broadcast(*(e.evaluate(right) for e in right_on_exprs)))
         null_equality = (
             plc.types.NullEquality.EQUAL
-            if join_nulls
+            if nulls_equal
             else plc.types.NullEquality.UNEQUAL
         )
         join_fn, left_policy, right_policy = cls._joiners(how)
@@ -1415,7 +1469,7 @@ class Distinct(IR):
     subset: frozenset[str] | None
     """Which columns should be used to define distinctness. If None,
     then all columns are used."""
-    zlice: tuple[int, int] | None
+    zlice: Zlice | None
     """Optional slice to apply to the result."""
     stable: bool
     """Should the result maintain ordering."""
@@ -1425,7 +1479,7 @@ class Distinct(IR):
         schema: Schema,
         keep: plc.stream_compaction.DuplicateKeepOption,
         subset: frozenset[str] | None,
-        zlice: tuple[int, int] | None,
+        zlice: Zlice | None,
         stable: bool,  # noqa: FBT001
         df: IR,
     ):
@@ -1449,7 +1503,7 @@ class Distinct(IR):
         cls,
         keep: plc.stream_compaction.DuplicateKeepOption,
         subset: frozenset[str] | None,
-        zlice: tuple[int, int] | None,
+        zlice: Zlice | None,
         stable: bool,  # noqa: FBT001
         df: DataFrame,
     ):
@@ -1505,7 +1559,7 @@ class Sort(IR):
     """Null sorting location for each sort key."""
     stable: bool
     """Should the sort be stable?"""
-    zlice: tuple[int, int] | None
+    zlice: Zlice | None
     """Optional slice to apply to the result."""
 
     def __init__(
@@ -1515,7 +1569,7 @@ class Sort(IR):
         order: Sequence[plc.types.Order],
         null_order: Sequence[plc.types.NullOrder],
         stable: bool,  # noqa: FBT001
-        zlice: tuple[int, int] | None,
+        zlice: Zlice | None,
         df: IR,
     ):
         self.schema = schema
@@ -1540,7 +1594,7 @@ class Sort(IR):
         order: Sequence[plc.types.Order],
         null_order: Sequence[plc.types.NullOrder],
         stable: bool,  # noqa: FBT001
-        zlice: tuple[int, int] | None,
+        zlice: Zlice | None,
         df: DataFrame,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
@@ -1638,6 +1692,41 @@ class Projection(IR):
         return DataFrame(columns)
 
 
+class MergeSorted(IR):
+    """Merge sorted operation."""
+
+    __slots__ = ("key",)
+    _non_child = ("schema", "key")
+    key: str
+    """Key that is sorted."""
+
+    def __init__(self, schema: Schema, key: str, left: IR, right: IR):
+        assert isinstance(left, Sort)
+        assert isinstance(right, Sort)
+        assert left.order == right.order
+        assert len(left.schema.keys()) <= len(right.schema.keys())
+        self.schema = schema
+        self.key = key
+        self.children = (left, right)
+        self._non_child_args = (key,)
+
+    @classmethod
+    def do_evaluate(cls, key: str, *dfs: DataFrame) -> DataFrame:
+        left, right = dfs
+        right = right.discard_columns(right.column_names_set - left.column_names_set)
+        on_col_left = left.select_columns({key})[0]
+        on_col_right = right.select_columns({key})[0]
+        return DataFrame.from_table(
+            plc.merge.merge(
+                [right.table, left.table],
+                [left.column_names.index(key), right.column_names.index(key)],
+                [on_col_left.order, on_col_right.order],
+                [on_col_left.null_order, on_col_right.null_order],
+            ),
+            left.column_names,
+        )
+
+
 class MapFunction(IR):
     """Apply some function to a dataframe."""
 
@@ -1651,13 +1740,10 @@ class MapFunction(IR):
     _NAMES: ClassVar[frozenset[str]] = frozenset(
         [
             "rechunk",
-            # libcudf merge is not stable wrt order of inputs, since
-            # it uses a priority queue to manage the tables it produces.
-            # See: https://github.com/rapidsai/cudf/issues/16010
-            # "merge_sorted",
             "rename",
             "explode",
             "unpivot",
+            "row_index",
         ]
     )
 
@@ -1666,8 +1752,12 @@ class MapFunction(IR):
         self.name = name
         self.options = options
         self.children = (df,)
-        if self.name not in MapFunction._NAMES:
-            raise NotImplementedError(f"Unhandled map function {self.name}")
+        if (
+            self.name not in MapFunction._NAMES
+        ):  # pragma: no cover; need more polars rust functions
+            raise NotImplementedError(
+                f"Unhandled map function {self.name}"
+            )  # pragma: no cover
         if self.name == "explode":
             (to_explode,) = self.options
             if len(to_explode) > 1:
@@ -1704,6 +1794,9 @@ class MapFunction(IR):
                 variable_name,
                 value_name,
             )
+        elif self.name == "row_index":
+            col_name, offset = options
+            self.options = (col_name, offset)
         self._non_child_args = (schema, name, self.options)
 
     @classmethod
@@ -1769,6 +1862,23 @@ class MapFunction(IR):
                     Column(value_column, name=value_name),
                 ]
             )
+        elif name == "row_index":
+            col_name, offset = options
+            dtype = schema[col_name]
+            step = plc.interop.from_arrow(
+                pa.scalar(1, type=plc.interop.to_arrow(dtype))
+            )
+            init = plc.interop.from_arrow(
+                pa.scalar(offset, type=plc.interop.to_arrow(dtype))
+            )
+            index_col = Column(
+                plc.filling.sequence(df.num_rows, init, step),
+                is_sorted=plc.types.Sorted.YES,
+                order=plc.types.Order.ASCENDING,
+                null_order=plc.types.NullOrder.AFTER,
+                name=col_name,
+            )
+            return DataFrame([index_col, *df.columns])
         else:
             raise AssertionError("Should never be reached")  # pragma: no cover
 
@@ -1778,10 +1888,10 @@ class Union(IR):
 
     __slots__ = ("zlice",)
     _non_child = ("schema", "zlice")
-    zlice: tuple[int, int] | None
+    zlice: Zlice | None
     """Optional slice to apply to the result."""
 
-    def __init__(self, schema: Schema, zlice: tuple[int, int] | None, *children: IR):
+    def __init__(self, schema: Schema, zlice: Zlice | None, *children: IR):
         self.schema = schema
         self.zlice = zlice
         self._non_child_args = (zlice,)
@@ -1789,7 +1899,7 @@ class Union(IR):
         schema = self.children[0].schema
 
     @classmethod
-    def do_evaluate(cls, zlice: tuple[int, int] | None, *dfs: DataFrame) -> DataFrame:
+    def do_evaluate(cls, zlice: Zlice | None, *dfs: DataFrame) -> DataFrame:
         """Evaluate and return a dataframe."""
         # TODO: only evaluate what we need if we have a slice?
         return DataFrame.from_table(
