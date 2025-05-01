@@ -30,7 +30,7 @@ function(ConfigureTest CMAKE_TEST_NAME)
 
   if(NOT DEFINED _CUDF_TEST_GPUS AND NOT DEFINED _CUDF_TEST_PERCENT)
     set(_CUDF_TEST_GPUS 1)
-    set(_CUDF_TEST_PERCENT 10)
+    set(_CUDF_TEST_PERCENT 15)
   endif()
 
   if(NOT DEFINED _CUDF_TEST_GPUS)
@@ -257,7 +257,7 @@ ConfigureTest(
   binaryop/binop-compiled-fixed_point-test.cpp
   binaryop/binop-generic-ptx-test.cpp
   GPUS 1
-  PERCENT 100
+  PERCENT 70
 )
 
 # ##################################################################################################
@@ -300,7 +300,7 @@ ConfigureTest(CSV_TEST io/csv_test.cpp EXTRA_LIBS ${ARROW_LIBRARIES})
 ConfigureTest(
   ORC_TEST io/orc_chunked_reader_test.cu io/orc_test.cpp
   GPUS 1
-  PERCENT 100
+  PERCENT 70
 )
 ConfigureTest(
   PARQUET_TEST
@@ -314,7 +314,7 @@ ConfigureTest(
   io/parquet_v2_test.cpp
   io/parquet_writer_test.cpp
   GPUS 1
-  PERCENT 100
+  PERCENT 70
 )
 ConfigureTest(
   JSON_TEST io/json/json_test.cpp io/json/json_chunked_reader.cu EXTRA_LIBS ${ARROW_LIBRARIES}
@@ -368,7 +368,7 @@ ConfigureTest(
   copying/utility_tests.cpp
   copying/reverse_tests.cpp
   GPUS 1
-  PERCENT 100
+  PERCENT 70
 )
 
 # ##################################################################################################
